@@ -79,6 +79,14 @@ if [[ -d "$ROOT_DIR/packing/manifests/system-skills" ]]; then
 	cp -a "$ROOT_DIR/packing/manifests/system-skills/." "$LIB_DIR/system-skills/"
 fi
 
+# Custom OpenAI-compatible provider manager (/custom-provider). Own lib dir so it
+# is identical across the native / wrapper / standalone layouts.
+if [[ -f "$ROOT_DIR/tools/custom-provider/custom-provider.mjs" && -f "$ROOT_DIR/bin/opencode-custom-provider" ]]; then
+	ensure_dir "$PREFIX_DIR/lib/opencode-custom-provider"
+	install -m 755 "$ROOT_DIR/tools/custom-provider/custom-provider.mjs" "$PREFIX_DIR/lib/opencode-custom-provider/custom-provider.mjs"
+	install -m 755 "$ROOT_DIR/bin/opencode-custom-provider" "$PREFIX_DIR/bin/opencode-custom-provider"
+fi
+
 DOCS_LIST="${DOCS_LIST:-$ROOT_DIR/docs/bundle-list.txt}"
 DOCS_OUT="$PREFIX_DIR/share/opencode/docs"
 if [[ -f "$DOCS_LIST" ]]; then

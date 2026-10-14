@@ -1,0 +1,20 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# bin/opencode-custom-provider — launcher for the custom OpenAI-compatible
+# provider manager (see docs/custom-provider.md). Runs on bun or node.
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT="${OPENCODE_CP_SCRIPT:-$SELF_DIR/../lib/opencode-custom-provider/custom-provider.mjs}"
+
+[[ -f "$SCRIPT" ]] || {
+	echo "opencode-custom-provider: script not found: $SCRIPT" >&2
+	exit 1
+}
+
+if command -v node >/dev/null 2>&1; then
+	exec node "$SCRIPT" "$@"
+elif command -v bun >/dev/null 2>&1; then
+	exec bun "$SCRIPT" "$@"
+fi
+echo "opencode-custom-provider: need node or bun (pkg install nodejs)" >&2
+exit 1

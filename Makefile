@@ -260,6 +260,7 @@ selfcheck:
 # Run the shell unit test suite (bats). Fetches a pinned bats-core on demand.
 test:
 	./tests/run.sh
+	@if command -v node >/dev/null 2>&1; then node --test tests/unit/custom-provider.test.mjs; else echo 'skip custom-provider tests (node not found)'; fi
 
 matrix:
 	@VERS='$(VERS)' ODIR='$(ODIR)' TARGET_HOST='$(TARGET_HOST)' TARGET_PORT='$(TARGET_PORT)' TARGET_USER='$(TARGET_USER)' ./tools/upgrade-matrix.sh
