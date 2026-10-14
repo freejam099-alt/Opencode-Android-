@@ -4,7 +4,19 @@ Add any OpenAI-compatible endpoint (OpenRouter, a self-hosted proxy, Ollama, LM 
 OpenCode on Termux, with API key, display name, base URL and automatic model fetching.
 **OpenCode Zen (provider id `opencode`) and every other entry in your config are never modified.**
 
-## Install
+## Install (Termux, one line)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/freejam099-alt/Opencode-Android-/main/install.sh | bash
+```
+
+Installs OpenCode if missing, `nodejs` if no JS runtime is present, then the add-on and the slash command.
+Uninstall: `curl -fsSL .../install.sh | bash -s -- --uninstall`.
+
+Tool calling: new models are written with `tool_call: true` (pass `--no-tools` to omit); OpenCode's
+built-in tools (read/edit/bash/...) work through `@ai-sdk/openai-compatible` as long as the model/server supports function calling.
+
+## Manual install
 
 Shipped in the package as `opencode-custom-provider` (needs `node` or `bun`). From a source checkout:
 

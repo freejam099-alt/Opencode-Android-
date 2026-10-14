@@ -6,6 +6,43 @@ OpenCode on Termux. AI-powered coding assistant, native bionic runtime, zero gli
 
 ![opencode v2 TUI](./assets/screenshots/opencode-v2-tui.webp)
 
+## Custom Provider + Tool Calling (Android / Termux)
+
+Tambahkan provider AI apa pun yang kompatibel dengan OpenAI SDK (OpenRouter, proxy sendiri, Ollama, LM Studio, dll.) lewat `/custom-provider` — atur **nama**, **base URL**, **API key**, dan **fetch model otomatis**. Model custom mendukung **tool calling** (read/edit/bash, dll.) dan **OpenCode Zen tetap utuh**.
+Add any OpenAI-compatible provider via `/custom-provider`: name, base URL, API key, automatic model fetch, tool calling on by default. OpenCode Zen is never touched.
+
+### Install di Termux / Install on Termux
+
+```bash
+pkg update && pkg upgrade -y
+pkg install -y curl
+curl -fsSL https://raw.githubusercontent.com/freejam099-alt/Opencode-Android-/main/install.sh | bash
+```
+
+Skrip ini (sama seperti cara lama: satu `curl | bash`) memasang OpenCode bila belum ada, `nodejs` bila belum ada, lalu `opencode-custom-provider` + command `/custom-provider`. Restart OpenCode setelahnya.
+
+### Pakai / Usage
+
+```bash
+opencode-custom-provider                                   # wizard interaktif (key disembunyikan)
+opencode-custom-provider add "My Proxy" https://api.example.com/v1 --key-env MY_KEY
+opencode-custom-provider models --all                      # fetch ulang daftar model
+```
+
+Di dalam OpenCode / inside OpenCode:
+
+```text
+/custom-provider add "My Proxy" https://api.example.com/v1 --key-clipboard
+/custom-provider list
+/custom-provider models --all
+/custom-provider set my-proxy --name "Proxy 2" --base-url https://other/v1
+/custom-provider remove my-proxy
+```
+
+Pilih model sebagai `my-proxy/<model>` atau lewat `/models`. Jangan pakai `--key` di dalam OpenCode (tersimpan di riwayat sesi); pakai `--key-clipboard` / `--key-env` / wizard. Tanpa tool calling: `--no-tools`.
+Update: `curl -fsSL .../install.sh | bash` lagi. Uninstall: `curl -fsSL .../install.sh | bash -s -- --uninstall`.
+Detail: [docs/custom-provider.md](./docs/custom-provider.md).
+
 ## Quick install
 
 ```bash

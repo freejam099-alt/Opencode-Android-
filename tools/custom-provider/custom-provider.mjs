@@ -357,11 +357,13 @@ export async function fetchModels(baseURL, key, { headers = {}, timeoutMs = DEFA
 // --------------------------------------------------------------------------
 // provider ops
 // --------------------------------------------------------------------------
-function buildModelsMap(existing, ids) {
+// New models get `tool_call: true` (agentic tool use: read/edit/bash/...) unless --no-tools.
+function buildModelsMap(existing, ids, { tools = true } = {}) {
+  const fresh = (id) => ({ name: id, ...(tools ? { tool_call: true } : {}) })
   const map = {}
-  for (const id of ids) map[id] = existing?.[id] && typeof existing[id] === "object" ? existing[id] : { name: id }
-  // keep user-customised entries (extra props beyond `name`) even if the server dropped them
-  for (const [id, v] of Object.entries(existing || {})) if (!(id in map) && v && Object.keys(v).some((k) => k !== "name")) map[id] = v
+  for (const id of ids) map[id] = existing?.[id] && typeof existing[id] === "object" ? existing[id] : fresh(id)
+  // keep user-customised entries (anything beyond name/tool_call) even if the server dropped them
+  for (const [id, v] of Object.entries(existing || {})) if (!(id in map) && v && Object.keys(v).some((k) => k !== "name" && k !== "tool_call")) map[id] = v
   return map
 }
 
@@ -435,7 +437,7 @@ export async function cmdAdd(P, args, flags, io, deps = {}) {
       ...(key ? { apiKey: `{file:${tildePath(P, P.keyFile(id))}}` } : {}),
       ...(Object.keys(headers).length ? { headers } : {}),
     },
-    models: buildModelsMap({}, ids),
+    models: buildModelsMap({}, ids, { tools: !flags["no-tools"] }),
   }
   saveConfig(P, loaded, (cfg) => {
     cfg.provider = cfg.provider || {}
@@ -492,7 +494,7 @@ export async function cmdModels(P, args, flags, io, deps = {}) {
       const before = Object.keys(entry.models || {})
       if (!flags["dry-run"]) {
         entry.options.baseURL = r.baseURL
-        entry.models = buildModelsMap(entry.models, sel.ids)
+        entry.models = buildModelsMap(entry.models, sel.ids, { tools: !flags["no-tools"] })
         fs.mkdirSync(P.dataDir, { recursive: true })
         atomicWrite(P.modelsCache(id), JSON.stringify({ fetchedAt: new Date().toISOString(), ids: r.ids.filter((x) => MODEL_ID_RE.test(x)) }) + "\n")
       }
@@ -589,7 +591,7 @@ function cmdUninstallCommand(P, io) {
 export function parseArgs(argv) {
   const flags = {}
   const args = []
-  const BOOL = new Set(["no-key", "no-fetch", "key-clipboard", "all", "list", "dry-run", "force", "help"])
+  const BOOL = new Set(["no-key", "no-fetch", "key-clipboard", "all", "list", "dry-run", "force", "help", "no-tools"])
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a.startsWith("--")) {
@@ -616,7 +618,7 @@ export const HELP = `opencode-custom-provider -- OpenAI-compatible custom provid
                                    add/remove the /custom-provider slash command
 
 key options:  --key-env VAR | --key-file PATH | --key-clipboard | --no-key | --key VALUE (not recommended)
-other:        --id ID  --models a,b,c  --no-fetch  --filter REGEX  --max N  --timeout SEC  --header Name=Value
+other:        --no-tools (models without tool calling)  --id ID  --models a,b,c  --no-fetch  --filter REGEX  --max N  --timeout SEC  --header Name=Value
 
 OpenCode Zen (provider id "opencode") and all other config entries are never modified.
 Inside OpenCode: /custom-provider add "My Proxy" https://example.com/v1 --key-clipboard

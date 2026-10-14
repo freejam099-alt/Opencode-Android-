@@ -78,6 +78,7 @@ test("add: fetches models, auto-corrects /v1, keeps key out of config, preserves
     assert.equal(p.name, "My Proxy")
     assert.equal(p.options.baseURL, `http://127.0.0.1:${port}/v1`)
     assert.deepEqual(Object.keys(p.models), ["gpt-x", "llama-3", "zzz"])
+    assert.deepEqual(p.models["gpt-x"], { name: "gpt-x", tool_call: true }) // tool calling on by default
     assert.match(p.options.apiKey, /^\{file:.*my-proxy\.key\}$/)
     assert.ok(!fs.readFileSync(t.cfgFile, "utf8").includes("sk-secret-1234"), "key must not be in opencode.json")
     const keyFile = path.join(t.env.OPENCODE_CP_CONFIG_DIR, "custom-providers", "my-proxy.key")
@@ -163,6 +164,12 @@ test("set / list / remove; Zen and others intact; files cleaned", async () => {
   const cfg = t.readCfg()
   assert.deepEqual(cfg, { provider: { opencode: { options: { timeout: 1 } } } })
   assert.ok(!fs.existsSync(path.join(t.env.OPENCODE_CP_CONFIG_DIR, "custom-providers", "prov.key")))
+})
+
+test("--no-tools omits tool_call", async () => {
+  const t = sandbox()
+  await t.run("add", "NoTools", "https://x.test/v1", "--models", "m", "--no-key", "--no-tools")
+  assert.deepEqual(t.readCfg().provider["notools"].models.m, { name: "m" })
 })
 
 test("install-command writes the slash command", async () => {
