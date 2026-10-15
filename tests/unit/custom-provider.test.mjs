@@ -5,7 +5,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import http from "node:http"
-import { main, parseJsonc, slugify, normalizeBaseURL, selectModels, extractModelIds } from "../../tools/custom-provider/custom-provider.mjs"
+import { main, looksReasoning, parseJsonc, slugify, normalizeBaseURL, selectModels, extractModelIds } from "../../tools/custom-provider/custom-provider.mjs"
 
 function mockServer(handler) {
   return new Promise((resolve) => {
@@ -157,7 +157,7 @@ test("set / list / remove; Zen and others intact; files cleaned", async () => {
   r = await t.run("set", "prov", "--name", "Renamed", "--key-file", (() => { const f = path.join(t.dir, "k"); fs.writeFileSync(f, "newkey\n"); return f })())
   assert.equal(r.code, 0, r.out)
   r = await t.run("list")
-  assert.match(r.out, /prov {2}"Renamed" {2}https:\/\/api\.example\.com\/v1 {2}models=2 {2}key=\*\*\*\*/)
+  assert.match(r.out, /prov {2}"Renamed" {2}https:\/\/api\.example\.com\/v1 {2}models=2 {2}key=set$/m)
   assert.ok(!r.out.includes("newkey"))
   r = await t.run("remove", "prov")
   assert.equal(r.code, 0, r.out)
@@ -178,4 +178,65 @@ test("install-command writes the slash command", async () => {
   assert.equal(r.code, 0)
   const md = fs.readFileSync(path.join(t.env.OPENCODE_CP_CONFIG_DIR, "commands", "custom-provider.md"), "utf8")
   assert.match(md, /opencode-custom-provider \$ARGUMENTS/)
+})
+
+test("reasoning: auto by model id, force on/off, refresh fills but never overwrites user choice", async () => {
+  assert.ok(["o3-mini", "gpt-5", "deepseek-reasoner", "deepseek-r1", "qwen3-coder", "kimi-k2-thinking", "openai/gpt-oss-120b", "claude-sonnet-4-5", "gemini-2.5-pro"].every(looksReasoning))
+  assert.ok(["gpt-4o", "llama-3.1-70b", "mistral-small", "text-embedding-3"].every((id) => !looksReasoning(id)))
+  const ids = ["o3-mini", "gpt-4o"]
+  const { srv, port } = await mockServer((req, res) => res.end(JSON.stringify({ data: ids.map((id) => ({ id })) })))
+  const t = sandbox()
+  try {
+    await t.run("add", "R", `http://127.0.0.1:${port}/v1`, "--no-key")
+    let m = t.readCfg().provider.r.models
+    assert.deepEqual(m["o3-mini"], { name: "o3-mini", tool_call: true, reasoning: true })
+    assert.deepEqual(m["gpt-4o"], { name: "gpt-4o", tool_call: true })
+    // user explicitly disables reasoning on o3-mini; refresh must keep it
+    const cfg = t.readCfg()
+    cfg.provider.r.models["o3-mini"].reasoning = false
+    fs.writeFileSync(t.cfgFile, JSON.stringify(cfg))
+    await t.run("models", "r")
+    assert.equal(t.readCfg().provider.r.models["o3-mini"].reasoning, false)
+    await t.run("add", "R2", `http://127.0.0.1:${port}/v1`, "--no-key", "--reasoning")
+    assert.equal(t.readCfg().provider.r2.models["gpt-4o"].reasoning, true)
+    await t.run("add", "R3", `http://127.0.0.1:${port}/v1`, "--no-key", "--no-reasoning")
+    assert.equal(t.readCfg().provider.r3.models["o3-mini"].reasoning, undefined)
+  } finally {
+    srv.close()
+  }
+})
+
+test("input validation and no key leakage in list", async () => {
+  const t = sandbox()
+  let r = await t.run("add", "V", "https://x.test/v1", "--models", "m", "--no-key", "--max", "abc")
+  assert.equal(r.code, 0) // --max unused with --models
+  r = await t.run("models", "--all", "--max", "0")
+  assert.equal(r.code, 1)
+  r = await t.run("add", "W", "https://x.test/v1", "--key-env")
+  assert.equal(r.code, 1)
+  assert.match(r.out, /Missing value for --key-env/)
+  const f = path.join(t.dir, "k")
+  fs.writeFileSync(f, "sk-supersecret-ABCDEFGH")
+  await t.run("add", "K", "https://x.test/v1", "--models", "m", "--key-file", f)
+  r = await t.run("list")
+  assert.ok(!/supersecret|ABCDEFGH|sk-/.test(r.out), r.out)
+  assert.match(r.out, /key=set/)
+})
+
+test("set --no-key removes ref and file; --force keeps customised models", async () => {
+  const t = sandbox()
+  const f = path.join(t.dir, "k")
+  fs.writeFileSync(f, "abc12345")
+  await t.run("add", "S", "https://x.test/v1", "--models", "m", "--key-file", f)
+  const keyFile = path.join(t.env.OPENCODE_CP_CONFIG_DIR, "custom-providers", "s.key")
+  assert.ok(fs.existsSync(keyFile))
+  await t.run("set", "s", "--no-key")
+  assert.ok(!fs.existsSync(keyFile))
+  assert.equal(t.readCfg().provider.s.options.apiKey, undefined)
+  const cfg = t.readCfg()
+  cfg.provider.s.models.m.limit = { context: 9, output: 9 }
+  fs.writeFileSync(t.cfgFile, JSON.stringify(cfg))
+  const r = await t.run("add", "S", "https://x.test/v1", "--models", "m", "--no-key", "--force")
+  assert.equal(r.code, 0, r.out)
+  assert.deepEqual(t.readCfg().provider.s.models.m.limit, { context: 9, output: 9 })
 })

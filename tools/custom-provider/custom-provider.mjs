@@ -38,6 +38,12 @@ export const RESERVED_IDS = new Set([
 const DEFAULT_MAX_MODELS = 200
 const DEFAULT_TIMEOUT_MS = 15000
 const MAX_BODY_BYTES = 5 * 1024 * 1024
+const num = (v, name, dflt) => {
+  if (v === undefined || v === true) return dflt
+  const n = Number(v)
+  if (!Number.isFinite(n) || n <= 0) fail(`--${name} must be a positive number`)
+  return n
+}
 const MODEL_ID_RE = /^[\w.:@+/-]{1,128}$/
 
 // --------------------------------------------------------------------------
@@ -357,15 +363,32 @@ export async function fetchModels(baseURL, key, { headers = {}, timeoutMs = DEFA
 // --------------------------------------------------------------------------
 // provider ops
 // --------------------------------------------------------------------------
-// New models get `tool_call: true` (agentic tool use: read/edit/bash/...) unless --no-tools.
-function buildModelsMap(existing, ids, { tools = true } = {}) {
-  const fresh = (id) => ({ name: id, ...(tools ? { tool_call: true } : {}) })
+// Models that are known/likely to accept a reasoning effort. Used only for the `auto` mode;
+// force with --reasoning, disable with --no-reasoning.
+const REASONING_RE = /(^|[/:_-])(o[134](-|$)|gpt-5|gpt-oss|r1(-|$)|reasoner|qwq|qwen3|thinking|magistral|glm-(4\.[5-9]|[5-9])|kimi-k2|deepseek-v[34]|grok-[34]|claude-(opus|sonnet)|gemini-(2\.5|3))/i
+export const looksReasoning = (id) => REASONING_RE.test(id)
+const reasoningFor = (id, mode) => (mode === "on" ? true : mode === "off" ? false : looksReasoning(id))
+
+// New models get `tool_call: true` (agentic tool use) unless --no-tools, and `reasoning: true`
+// (enables think-effort variants) per the reasoning mode. Existing entries are preserved; missing
+// `reasoning`/`tool_call` keys are filled in, anything the user set explicitly is never overwritten.
+function buildModelsMap(existing, ids, { tools = true, reasoning = "auto" } = {}) {
+  const fresh = (id) => ({ name: id, ...(tools ? { tool_call: true } : {}), ...(reasoningFor(id, reasoning) ? { reasoning: true } : {}) })
   const map = {}
-  for (const id of ids) map[id] = existing?.[id] && typeof existing[id] === "object" ? existing[id] : fresh(id)
-  // keep user-customised entries (anything beyond name/tool_call) even if the server dropped them
-  for (const [id, v] of Object.entries(existing || {})) if (!(id in map) && v && Object.keys(v).some((k) => k !== "name" && k !== "tool_call")) map[id] = v
+  for (const id of ids) {
+    const cur = existing?.[id]
+    if (cur && typeof cur === "object") {
+      map[id] = { ...cur }
+      if (map[id].reasoning === undefined && reasoningFor(id, reasoning)) map[id].reasoning = true
+      if (map[id].tool_call === undefined && tools) map[id].tool_call = true
+    } else map[id] = fresh(id)
+  }
+  // keep user-customised entries (anything beyond name/tool_call/reasoning) even if the server dropped them
+  for (const [id, v] of Object.entries(existing || {})) if (!(id in map) && v && Object.keys(v).some((k) => !["name", "tool_call", "reasoning"].includes(k))) map[id] = v
   return map
 }
+
+const reasoningMode = (flags) => (flags["no-reasoning"] ? "off" : flags.reasoning ? "on" : "auto")
 
 function parseHeaders(list) {
   const out = {}
@@ -380,7 +403,7 @@ function parseHeaders(list) {
 function describe(id, entry, P) {
   const n = Object.keys(entry.models || {}).length
   const key = readKey(P, id)
-  return `${id}  "${entry.name}"  ${entry.options?.baseURL}  models=${n}  key=${maskKey(key)}`
+  return `${id}  "${entry.name}"  ${entry.options?.baseURL}  models=${n}  key=${key ? "set" : "none"}`
 }
 
 export async function cmdAdd(P, args, flags, io, deps = {}) {
@@ -402,6 +425,7 @@ export async function cmdAdd(P, args, flags, io, deps = {}) {
   if (loaded.cfg.provider?.[id] && !reg.providers[id]) fail(`A provider "${id}" already exists in ${loaded.file} and was not created by this tool. Pick another name/--id.`)
   if (reg.providers[id] && !flags.force) fail(`Provider "${id}" already exists. Use "set ${id} ..." to change it or "remove ${id}" first (or pass --force).`)
 
+  const existingEntry = flags.force ? loaded.cfg.provider?.[id] : undefined
   let baseURL = normalizeBaseURL(url)
   let keyInfo = resolveKeyFromFlags(flags, deps.env)
   if (keyInfo.key === undefined && !keyInfo.none && io.interactive) {
@@ -416,33 +440,40 @@ export async function cmdAdd(P, args, flags, io, deps = {}) {
   if (flags.models) {
     ids = String(flags.models).split(",").map((s) => s.trim()).filter(Boolean)
   } else if (!flags["no-fetch"]) {
-    const r = await fetchModels(baseURL, key, { headers, timeoutMs: Number(flags.timeout || DEFAULT_TIMEOUT_MS / 1000) * 1000, fetchImpl: deps.fetchImpl })
+    const r = await fetchModels(baseURL, key, { headers, timeoutMs: num(flags.timeout, "timeout", DEFAULT_TIMEOUT_MS / 1000) * 1000, fetchImpl: deps.fetchImpl })
     if (r.baseURL !== baseURL) info += `base URL corrected to ${r.baseURL}\n`
     baseURL = r.baseURL
-    const sel = selectModels(r.ids, { filter: flags.filter, max: flags.max ? Number(flags.max) : DEFAULT_MAX_MODELS })
+    const sel = selectModels(r.ids, { filter: flags.filter, max: num(flags.max, "max", DEFAULT_MAX_MODELS) })
     ids = sel.ids
     info += modelSummary(sel)
     fs.mkdirSync(P.dataDir, { recursive: true })
     atomicWrite(P.modelsCache(id), JSON.stringify({ fetchedAt: new Date().toISOString(), ids: r.ids.filter((x) => MODEL_ID_RE.test(x)) }) + "\n")
   }
 
-  if (key) writeKey(P, id, key)
-  else if (fs.existsSync(P.keyFile(id))) fs.rmSync(P.keyFile(id))
-
+  const hadKey = fs.existsSync(P.keyFile(id))
+  if (key) writeKey(P, id, key) // key file first: config must never reference a missing file
   const entry = {
     npm: NPM_PKG,
     name,
     options: {
+      ...(existingEntry?.options || {}),
       baseURL,
       ...(key ? { apiKey: `{file:${tildePath(P, P.keyFile(id))}}` } : {}),
       ...(Object.keys(headers).length ? { headers } : {}),
     },
-    models: buildModelsMap({}, ids, { tools: !flags["no-tools"] }),
+    models: buildModelsMap(existingEntry?.models, ids, { tools: !flags["no-tools"], reasoning: reasoningMode(flags) }),
   }
-  saveConfig(P, loaded, (cfg) => {
-    cfg.provider = cfg.provider || {}
-    cfg.provider[id] = entry
-  }, [id])
+  if (!key) delete entry.options.apiKey
+  try {
+    saveConfig(P, loaded, (cfg) => {
+      cfg.provider = cfg.provider || {}
+      cfg.provider[id] = entry
+    }, [id])
+  } catch (e) {
+    if (key && !hadKey) fs.rmSync(P.keyFile(id), { force: true })
+    throw e
+  }
+  if (!key && fs.existsSync(P.keyFile(id))) fs.rmSync(P.keyFile(id)) // config no longer references it
   reg.providers[id] = { name, createdAt: new Date().toISOString() }
   saveRegistry(P, reg)
 
@@ -472,7 +503,7 @@ export async function cmdModels(P, args, flags, io, deps = {}) {
       const entry = loaded.cfg.provider[id]
       const r = await fetchModels(entry.options.baseURL, readKey(P, id), {
         headers: entry.options.headers || {},
-        timeoutMs: Number(flags.timeout || DEFAULT_TIMEOUT_MS / 1000) * 1000,
+        timeoutMs: num(flags.timeout, "timeout", DEFAULT_TIMEOUT_MS / 1000) * 1000,
         fetchImpl: deps.fetchImpl,
       })
       return { id, r }
@@ -490,11 +521,11 @@ export async function cmdModels(P, args, flags, io, deps = {}) {
   save(P, loaded, (cfg) => {
     for (const { id, r } of updates) {
       const entry = cfg.provider[id]
-      const sel = selectModels(r.ids, { filter: flags.filter, max: flags.max ? Number(flags.max) : DEFAULT_MAX_MODELS })
+      const sel = selectModels(r.ids, { filter: flags.filter, max: num(flags.max, "max", DEFAULT_MAX_MODELS) })
       const before = Object.keys(entry.models || {})
       if (!flags["dry-run"]) {
         entry.options.baseURL = r.baseURL
-        entry.models = buildModelsMap(entry.models, sel.ids, { tools: !flags["no-tools"] })
+        entry.models = buildModelsMap(entry.models, sel.ids, { tools: !flags["no-tools"], reasoning: reasoningMode(flags) })
         fs.mkdirSync(P.dataDir, { recursive: true })
         atomicWrite(P.modelsCache(id), JSON.stringify({ fetchedAt: new Date().toISOString(), ids: r.ids.filter((x) => MODEL_ID_RE.test(x)) }) + "\n")
       }
@@ -533,12 +564,12 @@ export async function cmdSet(P, args, flags, io, deps = {}) {
     if (headers) e.options.headers = { ...(e.options.headers || {}), ...headers }
     if (keyInfo.none) {
       delete e.options.apiKey
-      if (fs.existsSync(P.keyFile(id))) fs.rmSync(P.keyFile(id))
     } else if (newKey) {
       writeKey(P, id, newKey)
       e.options.apiKey = `{file:${tildePath(P, P.keyFile(id))}}`
     }
   }, [id])
+  if (keyInfo.none && fs.existsSync(P.keyFile(id))) fs.rmSync(P.keyFile(id))
   if (flags.name) {
     reg.providers[id].name = String(flags.name)
     saveRegistry(P, reg)
@@ -591,7 +622,7 @@ function cmdUninstallCommand(P, io) {
 export function parseArgs(argv) {
   const flags = {}
   const args = []
-  const BOOL = new Set(["no-key", "no-fetch", "key-clipboard", "all", "list", "dry-run", "force", "help", "no-tools"])
+  const BOOL = new Set(["no-key", "no-fetch", "key-clipboard", "all", "list", "dry-run", "force", "help", "no-tools", "reasoning", "no-reasoning"])
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a.startsWith("--")) {
@@ -599,7 +630,10 @@ export function parseArgs(argv) {
       const k = a.slice(2, eq < 0 ? undefined : eq)
       let v = eq < 0 ? undefined : a.slice(eq + 1)
       if (BOOL.has(k)) v = v === undefined ? true : v !== "false"
-      else if (v === undefined) v = argv[++i]
+      else if (v === undefined) {
+        v = argv[++i]
+        if (v === undefined) fail(`Missing value for --${k}`)
+      }
       if (k === "header") flags.header = [...(flags.header || []), v]
       else flags[k] = v
     } else args.push(a)
@@ -618,7 +652,7 @@ export const HELP = `opencode-custom-provider -- OpenAI-compatible custom provid
                                    add/remove the /custom-provider slash command
 
 key options:  --key-env VAR | --key-file PATH | --key-clipboard | --no-key | --key VALUE (not recommended)
-other:        --no-tools (models without tool calling)  --id ID  --models a,b,c  --no-fetch  --filter REGEX  --max N  --timeout SEC  --header Name=Value
+other:        --no-tools  --reasoning | --no-reasoning (think effort; default: auto by model id)  --id ID  --models a,b,c  --no-fetch  --filter REGEX  --max N  --timeout SEC  --header Name=Value
 
 OpenCode Zen (provider id "opencode") and all other config entries are never modified.
 Inside OpenCode: /custom-provider add "My Proxy" https://example.com/v1 --key-clipboard
@@ -658,9 +692,9 @@ async function wizard(P, io) {
 export async function main(argv, deps = {}) {
   const P = paths(deps.env || process.env)
   const io = deps.io || makeIO()
-  const { args, flags } = parseArgs(argv)
-  const cmd = args.shift()
   try {
+    const { args, flags } = parseArgs(argv)
+    const cmd = args.shift()
     if (!cmd) {
       if (io.interactive) return await wizard(P, io)
       io.out(HELP)

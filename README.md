@@ -39,7 +39,7 @@ Di dalam OpenCode / inside OpenCode:
 /custom-provider remove my-proxy
 ```
 
-Pilih model sebagai `my-proxy/<model>` atau lewat `/models`. Jangan pakai `--key` di dalam OpenCode (tersimpan di riwayat sesi); pakai `--key-clipboard` / `--key-env` / wizard. Tanpa tool calling: `--no-tools`.
+Pilih model sebagai `my-proxy/<model>` atau lewat `/models`. Jangan pakai `--key` di dalam OpenCode (tersimpan di riwayat sesi); pakai `--key-clipboard` / `--key-env` / wizard. Think effort otomatis untuk model reasoning (`--reasoning` / `--no-reasoning` untuk paksa). Tanpa tool calling: `--no-tools`.
 Update: `curl -fsSL .../install.sh | bash` lagi. Uninstall: `curl -fsSL .../install.sh | bash -s -- --uninstall`.
 Detail: [docs/custom-provider.md](./docs/custom-provider.md).
 
