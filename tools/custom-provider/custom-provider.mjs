@@ -38,7 +38,7 @@ export const RESERVED_IDS = new Set([
   "mistral",
 ])
 const DEFAULT_RELAY_PORT = 18791
-const DEFAULT_MAX_MODELS = 200
+const DEFAULT_MAX_MODELS = 1000
 const DEFAULT_TIMEOUT_MS = 15000
 const MAX_BODY_BYTES = 5 * 1024 * 1024
 const num = (v, name, dflt) => {
@@ -47,7 +47,8 @@ const num = (v, name, dflt) => {
   if (!Number.isFinite(n) || n <= 0) fail(`--${name} must be a positive number`)
   return n
 }
-const MODEL_ID_RE = /^[\w.:@+/-]{1,128}$/
+// printable model ids only: no control chars/newlines/quotes/backticks (they are echoed into prompts by the slash command)
+const MODEL_ID_RE = /^(?!\s)[\p{L}\p{N}._:@+/()[\] -]{1,128}(?<!\s)$/u
 
 // --------------------------------------------------------------------------
 // paths
@@ -66,6 +67,7 @@ export function paths(env = process.env) {
     commandFile: path.join(configDir, "commands", "custom-provider.md"),
     relayState: path.join(dataDir, "relay.json"),
     relayLog: path.join(dataDir, "relay.log"),
+    paused: path.join(dataDir, "paused.json"),
   }
 }
 
@@ -73,6 +75,7 @@ export function paths(env = process.env) {
 // small utils
 // --------------------------------------------------------------------------
 export class CliError extends Error {}
+export class NoModelListError extends CliError {}
 const fail = (msg) => {
   throw new CliError(msg)
 }
@@ -206,11 +209,27 @@ function assertInvariant(before, after, managedIds) {
     const c = JSON.parse(JSON.stringify(cfg))
     if (c.provider) for (const id of managedIds) delete c.provider[id]
     if (c.provider && Object.keys(c.provider).length === 0) delete c.provider
+    for (const k of ["enabled_providers", "disabled_providers"]) if (Array.isArray(c[k])) c[k] = c[k].filter((x) => !managedIds.includes(x))
     delete c.$schema
     return c
   }
   if (!deepEqual(strip(before), strip(after))) fail("Internal safety check failed: unrelated config would change. Nothing was written.")
   if (after.provider?.opencode && !deepEqual(before.provider?.opencode, after.provider.opencode)) fail("Internal safety check failed: OpenCode Zen entry would change.")
+}
+
+// OpenCode 2.x turns `enabled_providers` into "deny every provider except these": a new provider that is
+// not listed there is silently hidden (models never appear). Keep our ids allowed.
+export function allowProvider(cfg, id) {
+  let touched = false
+  if (Array.isArray(cfg.enabled_providers) && !cfg.enabled_providers.includes(id)) {
+    cfg.enabled_providers.push(id)
+    touched = true
+  }
+  if (Array.isArray(cfg.disabled_providers) && cfg.disabled_providers.includes(id)) {
+    cfg.disabled_providers = cfg.disabled_providers.filter((x) => x !== id)
+    touched = true
+  }
+  return touched
 }
 
 export function saveConfig(P, loaded, mutate, managedIds) {
@@ -279,12 +298,15 @@ function resolveKeyFromFlags(flags, env = process.env) {
 // model fetching
 // --------------------------------------------------------------------------
 export function extractModels(body) {
-  let list = []
-  if (Array.isArray(body)) list = body
-  else if (body && Array.isArray(body.data)) list = body.data
-  else if (body && Array.isArray(body.models)) list = body.models
+  const arr = (v) => (Array.isArray(v) ? v : undefined)
+  let list = arr(body) || arr(body?.data) || arr(body?.models) || arr(body?.result) || arr(body?.items) || arr(body?.data?.models) || arr(body?.data?.data)
+  if (!list && body && typeof body === "object") {
+    // object keyed by model id: { "gpt-4": {...} } (optionally under data/models)
+    const m = [body.data, body.models, body].find((v) => v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length && Object.values(v).every((x) => x && typeof x === "object"))
+    if (m && !body.error) list = Object.entries(m).map(([id, v]) => ({ id: v.id ?? id, ...v }))
+  }
   const out = []
-  for (const m of list) {
+  for (const m of list || []) {
     const id = typeof m === "string" ? m : (m?.id ?? m?.name ?? m?.model)
     if (typeof id === "string") out.push({ id, raw: typeof m === "object" ? m : undefined })
   }
@@ -388,10 +410,7 @@ export async function fetchModels(baseURL, key, { headers = {}, timeoutMs = DEFA
     if (r.status === 401 || r.status === 403) fail(`Authentication failed (HTTP ${r.status}). Check the API key.`)
     if (r.status === 429) fail("Rate limited (HTTP 429). Try again shortly.")
   }
-  fail(
-    `Could not fetch models from ${baseURL}/models (last status ${lastStatus || "n/a"}).\n` +
-      `The server may not expose a model list; add models manually with: --models id1,id2`,
-  )
+  throw new NoModelListError(`Could not read a model list from ${baseURL}/models (last status ${lastStatus || "n/a"}).`)
 }
 
 // --------------------------------------------------------------------------
@@ -485,15 +504,24 @@ export async function cmdAdd(P, args, flags, io, deps = {}) {
   if (flags.models) {
     ids = String(flags.models).split(",").map((s) => s.trim()).filter(Boolean)
   } else if (!flags["no-fetch"]) {
-    const r = await fetchModels(baseURL, key, { headers, timeoutMs: num(flags.timeout, "timeout", DEFAULT_TIMEOUT_MS / 1000) * 1000, fetchImpl: deps.fetchImpl })
-    if (r.baseURL !== baseURL) info += `base URL corrected to ${r.baseURL}\n`
-    baseURL = r.baseURL
-    const sel = selectModels(r.ids, { filter: flags.filter, max: num(flags.max, "max", DEFAULT_MAX_MODELS) })
-    ids = sel.ids
-    meta = r.meta
-    info += modelSummary(sel)
-    fs.mkdirSync(P.dataDir, { recursive: true })
-    atomicWrite(P.modelsCache(id), JSON.stringify({ fetchedAt: new Date().toISOString(), ids: r.ids.filter((x) => MODEL_ID_RE.test(x)) }) + "\n")
+    let r = null
+    try {
+      r = await fetchModels(baseURL, key, { headers, timeoutMs: num(flags.timeout, "timeout", DEFAULT_TIMEOUT_MS / 1000) * 1000, fetchImpl: deps.fetchImpl })
+    } catch (e) {
+      // the server answered but has no usable /models list: still add the provider so models can be added by hand
+      if (!(e instanceof NoModelListError)) throw e
+      info += `warning: ${e.message}\nThe provider is added WITHOUT models. Add them with:  set ${id} --models model-a,model-b\n`
+    }
+    if (r) {
+      if (r.baseURL !== baseURL) info += `base URL corrected to ${r.baseURL}\n`
+      baseURL = r.baseURL
+      const sel = selectModels(r.ids, { filter: flags.filter, max: num(flags.max, "max", DEFAULT_MAX_MODELS) })
+      ids = sel.ids
+      meta = r.meta
+      info += modelSummary(sel)
+      fs.mkdirSync(P.dataDir, { recursive: true })
+      atomicWrite(P.modelsCache(id), JSON.stringify({ fetchedAt: new Date().toISOString(), ids: r.ids.filter((x) => MODEL_ID_RE.test(x)) }) + "\n")
+    }
   }
 
   const hadKey = fs.existsSync(P.keyFile(id))
@@ -510,10 +538,12 @@ export async function cmdAdd(P, args, flags, io, deps = {}) {
     models: buildModelsMap(existingEntry?.models, ids, { tools: !flags["no-tools"], reasoning: reasoningMode(flags), meta }),
   }
   if (!key) delete entry.options.apiKey
+  let allowed = false
   try {
     saveConfig(P, loaded, (cfg) => {
       cfg.provider = cfg.provider || {}
       cfg.provider[id] = entry
+      allowed = allowProvider(cfg, id)
     }, [id])
   } catch (e) {
     if (key && !hadKey) fs.rmSync(P.keyFile(id), { force: true })
@@ -524,7 +554,8 @@ export async function cmdAdd(P, args, flags, io, deps = {}) {
   saveRegistry(P, reg)
 
   io.out(`${info}Added provider "${name}" (id: ${id}) with ${ids.length} model(s).`)
-  if (!ids.length) io.out(`No models yet. Run: models ${id}   (or add with --models a,b)`)
+  if (allowed) io.out(`note: your config has enabled_providers/disabled_providers; "${id}" was added to the allow-list so it is not hidden.`)
+  if (!ids.length) io.out(`No models yet. Run: models ${id}   (or: set ${id} --models a,b)`)
   io.out(`Use it in OpenCode as ${id}/<model>. Restart OpenCode to load it. OpenCode Zen is untouched.`)
 }
 
@@ -532,7 +563,7 @@ function modelSummary(sel) {
   let s = `Fetched ${sel.total} model(s)`
   if (sel.skipped) s += `, skipped ${sel.skipped} with unsafe ids`
   s += ".\n"
-  if (sel.truncated) s += `Kept the first ${sel.ids.length}. Use --filter <regex> (or --max N) to choose which; very large model maps slow down startup.\n`
+  if (sel.truncated) s += `Kept the first ${sel.ids.length}. Use --filter <regex> (or --max N) to choose which; \n`
   return s
 }
 
@@ -596,9 +627,10 @@ export async function cmdModels(P, args, flags, io, deps = {}) {
 export function cmdList(P, io) {
   const reg = loadRegistry(P)
   const loaded = loadConfig(P)
-  const ids = Object.keys(reg.providers).filter((id) => loaded.cfg.provider?.[id])
+  const paused = readJson(P.paused, { providers: {} }).providers
+  const ids = Object.keys(reg.providers).filter((id) => loaded.cfg.provider?.[id] || paused[id])
   if (!ids.length) return io.out("No custom providers. Add one: add <name> <baseURL> [--key-env VAR]")
-  io.out(ids.map((id) => describe(id, loaded.cfg.provider[id], P, reg)).join("\n"))
+  io.out(ids.map((id) => describe(id, loaded.cfg.provider?.[id] || paused[id], P, reg) + (loaded.cfg.provider?.[id] ? "" : "  PAUSED")).join("\n"))
 }
 
 export async function cmdSet(P, args, flags, io, deps = {}) {
@@ -611,13 +643,17 @@ export async function cmdSet(P, args, flags, io, deps = {}) {
   const keyInfo = resolveKeyFromFlags(flags, deps.env)
   if (keyInfo.viaArgv) io.warn("Key was passed on the command line (it ends up in shell/session history). Prefer --key-env / --key-file / --key-clipboard.")
   let newKey = keyInfo.key
-  if (newKey === undefined && !keyInfo.none && !flags.name && !flags["base-url"] && !flags.header && relay === undefined && io.interactive) newKey = await io.ask("New API key (hidden, empty to keep): ", { hidden: true })
+  if (newKey === undefined && !keyInfo.none && !flags.name && !flags["base-url"] && !flags.header && !flags.models && relay === undefined && io.interactive) newKey = await io.ask("New API key (hidden, empty to keep): ", { hidden: true })
   const headers = flags.header ? parseHeaders(flags.header) : null
   const regEntry = reg.providers[id]
   const newBase = flags["base-url"] ? normalizeBaseURL(flags["base-url"]) : undefined
   reg.relay = reg.relay || { port: num(flags.port, "port", DEFAULT_RELAY_PORT) }
+  const manual = flags.models ? String(flags.models).split(",").map((x) => x.trim()).filter(Boolean) : []
+  for (const m of manual) if (!MODEL_ID_RE.test(m)) fail(`Invalid model id: ${m}`)
   saveConfig(P, loaded, (cfg) => {
     const e = cfg.provider[id]
+    allowProvider(cfg, id)
+    if (manual.length) e.models = { ...buildModelsMap(e.models, manual, { tools: !flags["no-tools"], reasoning: reasoningMode(flags) }), ...Object.fromEntries(Object.entries(e.models || {}).filter(([k]) => !manual.includes(k))) }
     if (flags.name) e.name = String(flags.name)
     // upstream = the real server. While the relay is on, config points at the relay instead.
     let upstream = regEntry.upstream
@@ -645,7 +681,7 @@ export async function cmdSet(P, args, flags, io, deps = {}) {
   if (keyInfo.none && fs.existsSync(P.keyFile(id))) fs.rmSync(P.keyFile(id))
   if (flags.name) regEntry.name = String(flags.name)
   saveRegistry(P, reg)
-  let msg = `Updated "${id}". ` + (newBase ? "Run: models " + id + "  to refresh the model list. " : "") + "Restart OpenCode to apply."
+  let msg = `Updated "${id}". ` + (manual.length ? `Added ${manual.length} model(s). ` : "") + (newBase ? "Run: models " + id + "  to refresh the model list. " : "") + "Restart OpenCode to apply."
   if (relay === "on") {
     msg += `\nRelay is ON for "${id}" (fixes servers that stream content after finish_reason). ` + (deps.noSpawn ? "" : await ensureRelay(P, io))
     msg += `\nStart OpenCode with: opencode-custom-provider launch   (starts the relay automatically)`
@@ -663,6 +699,7 @@ export function cmdRemove(P, args, flags, io) {
       delete cfg.provider[id]
       if (Object.keys(cfg.provider).length === 0) delete cfg.provider
     }
+    if (Array.isArray(cfg.enabled_providers)) cfg.enabled_providers = cfg.enabled_providers.filter((x) => x !== id)
   }, [id])
   for (const f of [P.keyFile(id), P.modelsCache(id)]) if (fs.existsSync(f)) fs.rmSync(f)
   delete reg.providers[id]
@@ -937,6 +974,151 @@ async function cmdDiagnose(P, args, flags, io, deps = {}) {
 }
 
 // --------------------------------------------------------------------------
+// doctor: find out why a provider/model does not show up
+// --------------------------------------------------------------------------
+const CFG_NAMES = ["opencode.json", "opencode.jsonc"]
+
+export function scanConfigs(P, cwd) {
+  const files = CFG_NAMES.map((n) => path.join(P.configDir, n))
+  let dir = path.resolve(cwd)
+  for (let i = 0; i < 40; i++) {
+    for (const n of CFG_NAMES) files.push(path.join(dir, n), path.join(dir, ".opencode", n))
+    const up = path.dirname(dir)
+    if (up === dir) break
+    dir = up
+  }
+  const out = []
+  for (const f of [...new Set(files)]) {
+    if (!fs.existsSync(f)) continue
+    const raw = fs.readFileSync(f, "utf8")
+    const global = path.dirname(f) === P.configDir
+    try {
+      out.push({ file: f, raw, cfg: parseJsonc(raw), global })
+    } catch (e) {
+      out.push({ file: f, raw, error: e.message, global })
+    }
+  }
+  return out
+}
+
+async function cmdDoctor(P, args, flags, io, deps = {}) {
+  const reg = loadRegistry(P)
+  const scans = scanConfigs(P, deps.cwd || process.cwd())
+  const lines = []
+  let problems = 0
+  const bad = (m) => (problems++, lines.push("PROBLEM " + m))
+  const ok = (m) => lines.push("ok      " + m)
+  const note = (m) => lines.push("note    " + m)
+  for (const sc of scans) if (sc.error) bad(`${sc.file} cannot be parsed: ${sc.error}`)
+  const good = scans.filter((x) => x.cfg)
+  const paused = readJson(P.paused, { providers: {} }).providers
+  const main = loadConfig(P)
+  const ids = args.length ? args.map((a) => slugify(a)) : Object.keys(reg.providers)
+  if (!ids.length) note("no custom providers registered")
+  const fixList = []
+  for (const id of ids) {
+    if (!reg.providers[id]) {
+      bad(`${id}: not a custom provider of this tool (see: list)`)
+      continue
+    }
+    const entry = main.cfg.provider?.[id]
+    if (!entry) {
+      paused[id] ? note(`${id}: PAUSED (run: resume)`) : bad(`${id}: registered but missing from ${main.file} (re-add it)`)
+      continue
+    }
+    const n = Object.keys(entry.models || {}).length
+    n ? ok(`${id}: ${n} model(s) in config (${main.file})`) : bad(`${id}: no models in config. Run: models ${id}   or: set ${id} --models a,b`)
+    const m = /^\{file:(.+)\}$/.exec(entry.options?.apiKey || "")
+    if (m) {
+      const kf = m[1].startsWith("~") ? path.join(P.home, m[1].slice(1)) : m[1]
+      fs.existsSync(kf) ? ok(`${id}: key file present`) : bad(`${id}: key file missing (${kf}); config would fail to load. Run: set ${id} --key-clipboard`)
+    } else if (!entry.options?.apiKey) note(`${id}: no API key configured`)
+    for (const sc of good) {
+      const en = sc.cfg.enabled_providers
+      if (Array.isArray(en) && !en.includes(id)) {
+        bad(`${id}: HIDDEN by enabled_providers in ${sc.file} (OpenCode only shows the providers listed there)`)
+        if (sc.global) fixList.push({ sc, id })
+        else lines.push(`        fix by hand: add "${id}" to enabled_providers in that file`)
+      }
+      if (Array.isArray(sc.cfg.disabled_providers) && sc.cfg.disabled_providers.includes(id)) {
+        bad(`${id}: HIDDEN by disabled_providers in ${sc.file}`)
+        if (sc.global) fixList.push({ sc, id })
+      }
+      if (Array.isArray(sc.cfg.policies) && sc.cfg.policies.some((x) => x?.action === "provider.use" && x?.effect === "deny" && (x.resource === "*" || x.resource === id)))
+        bad(`${id}: a policy in ${sc.file} denies provider.use for it`)
+      if (sc.file !== main.file && sc.cfg.provider?.[id]) note(`${id}: also defined in ${sc.file}; the two definitions are merged`)
+    }
+    if (!flags.offline) {
+      try {
+        const base = reg.providers[id].upstream || entry.options.baseURL
+        const r = await fetchModels(base, readKey(P, id), { headers: entry.options.headers || {}, timeoutMs: 8000, fetchImpl: deps.fetchImpl })
+        ok(`${id}: server answers, lists ${r.ids.length} model(s)`)
+      } catch (e) {
+        bad(`${id}: ${e.message}`)
+      }
+    }
+    if (reg.providers[id].upstream) {
+      const port = reg.relay?.port || DEFAULT_RELAY_PORT
+      if (await relayHealthy(port)) ok(`${id}: relay running on 127.0.0.1:${port}`)
+      else {
+        bad(`${id}: relay is ON but not running -> opencode cannot reach the server. Run: relay start (or start opencode with: launch)`)
+        fixList.push({ relay: true })
+      }
+    }
+  }
+  if (flags.fix && fixList.length) {
+    for (const f of fixList) {
+      if (f.relay) {
+        if (!deps.noSpawn) lines.push("fixed   " + (await ensureRelay(P, io)))
+      } else {
+        saveConfig(P, { file: f.sc.file, cfg: f.sc.cfg, raw: f.sc.raw, existed: true }, (cfg) => allowProvider(cfg, f.id), [f.id])
+        lines.push(`fixed   ${f.id}: allowed in ${f.sc.file}`)
+      }
+    }
+    lines.push("Restart OpenCode to apply.")
+  } else if (fixList.length) lines.push("Run again with --fix to repair what can be repaired automatically.")
+  if (!deps.noSpawn) {
+    const v = spawnSync("opencode", ["--version"], { encoding: "utf8", timeout: 5000 })
+    note(v.error ? "opencode not found in PATH" : `opencode ${String(v.stdout).trim().split("\n")[0]}`)
+  }
+  lines.push(problems ? `${problems} problem(s) found.` : "No problems found.")
+  io.out(lines.join("\n"))
+}
+
+// pause/resume: take every custom provider out of the config (and back) -- an A/B switch to check
+// whether a problem comes from this add-on or from OpenCode itself (built-in providers/Zen).
+function cmdPause(P, io) {
+  const reg = loadRegistry(P)
+  const loaded = loadConfig(P)
+  const ids = Object.keys(reg.providers).filter((id) => loaded.cfg.provider?.[id])
+  if (!ids.length) return io.out("Nothing to pause.")
+  const paused = readJson(P.paused, { providers: {} })
+  for (const id of ids) paused.providers[id] = loaded.cfg.provider[id]
+  atomicWrite(P.paused, JSON.stringify(paused, null, 2) + "\n", 0o600) // stash first, then remove
+  saveConfig(P, loaded, (cfg) => {
+    for (const id of ids) delete cfg.provider[id]
+    if (Object.keys(cfg.provider).length === 0) delete cfg.provider
+  }, ids)
+  io.out(`Paused ${ids.length} custom provider(s): ${ids.join(", ")}.\nOpenCode now sees only its built-in providers (including Zen). Restart it and test; then run: resume`)
+}
+
+function cmdResume(P, io) {
+  const paused = readJson(P.paused, { providers: {} })
+  const ids = Object.keys(paused.providers)
+  if (!ids.length) return io.out("Nothing is paused.")
+  const loaded = loadConfig(P)
+  saveConfig(P, loaded, (cfg) => {
+    cfg.provider = cfg.provider || {}
+    for (const id of ids) {
+      if (!cfg.provider[id]) cfg.provider[id] = paused.providers[id]
+      allowProvider(cfg, id)
+    }
+  }, ids)
+  fs.rmSync(P.paused, { force: true })
+  io.out(`Resumed ${ids.length} custom provider(s): ${ids.join(", ")}. Restart OpenCode.`)
+}
+
+// --------------------------------------------------------------------------
 // slash command installer (/custom-provider)
 // --------------------------------------------------------------------------
 export const COMMAND_MD = `---
@@ -964,7 +1146,7 @@ function cmdUninstallCommand(P, io) {
 export function parseArgs(argv) {
   const flags = {}
   const args = []
-  const BOOL = new Set(["no-key", "no-fetch", "key-clipboard", "all", "list", "dry-run", "force", "help", "no-tools", "reasoning", "no-reasoning"])
+  const BOOL = new Set(["no-key", "no-fetch", "key-clipboard", "all", "list", "dry-run", "force", "help", "no-tools", "reasoning", "no-reasoning", "fix", "offline"])
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a.startsWith("--")) {
@@ -988,8 +1170,10 @@ export const HELP = `opencode-custom-provider -- OpenAI-compatible custom provid
   add <name> <baseURL> [options]   create a provider and fetch its models
   list                             show custom providers
   models [id ...|--all] [options]  re-fetch the model list (--list to print, --dry-run to preview)
-  set <id> [options]               change --name / --base-url / key / --header
+  set <id> [options]               change --name / --base-url / key / --header / --models a,b (add models by hand)
   remove <id>                      delete provider, key file and model cache
+  doctor [id] [--fix] [--offline]   find why a provider/model is not shown (hidden by enabled_providers, missing key file, relay down...)
+  pause | resume                   remove/restore all custom providers (A/B test against built-in providers like Zen)
   diagnose <id> [--model M]        test the stream order of a provider (finds "content after finish reason")
   set <id> --relay on|off          local relay that fixes servers streaming content after finish_reason
   relay start|stop|status          manage the relay;  launch [opencode args]  starts relay + opencode
@@ -1054,7 +1238,10 @@ export async function main(argv, deps = {}) {
       case "set": case "edit": return await cmdSet(P, args, flags, io, deps)
       case "remove": case "rm": case "delete": return cmdRemove(P, args, flags, io)
       case "relay": return await cmdRelay(P, args, flags, io, deps)
-      case "diagnose": case "doctor": return await cmdDiagnose(P, args, flags, io, deps)
+      case "diagnose": return await cmdDiagnose(P, args, flags, io, deps)
+      case "doctor": return await cmdDoctor(P, args, flags, io, deps)
+      case "pause": return cmdPause(P, io)
+      case "resume": return cmdResume(P, io)
       case "install-command": return cmdInstallCommand(P, io)
       case "uninstall-command": return cmdUninstallCommand(P, io)
       default: fail(`Unknown command "${cmd}".\n\n${HELP}`)

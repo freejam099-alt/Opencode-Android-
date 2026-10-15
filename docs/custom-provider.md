@@ -46,6 +46,35 @@ Key sources: `--key-env VAR`, `--key-file PATH`, `--key-clipboard` (Termux:API),
 `--key VALUE`. **Avoid `--key` inside OpenCode**: slash-command arguments are saved in the session
 and sent to the active model. `--no-key` for local servers.
 
+## Provider or models do not show up
+
+```bash
+opencode-custom-provider doctor            # per-provider checklist (add --offline to skip the network test)
+opencode-custom-provider doctor --fix      # repairs what is safe to repair
+```
+
+OpenCode 2.x compiles `enabled_providers` into "deny every provider except these" (and `disabled_providers` into
+explicit denies), so a provider missing from such a list is silently hidden even though its models are in the config.
+`add`/`set` now keep our ids allowed; `doctor` finds whitelists in the global config and in project configs
+(`opencode.json(c)` and `.opencode/` from the current directory upwards), a missing key file (the config would
+fail to load), a dead relay, and an unreachable server. If a server has no usable `/models`, the provider is still
+added: `set <id> --models a,b` adds models by hand.
+
+## Built-in models (Zen) cannot call tools?
+
+This add-on never writes the `opencode` (Zen) provider; every write is checked against that invariant, and the
+generated config was decoded and migrated with upstream's own v1->v2 config code in testing. To prove it on your device:
+
+```bash
+opencode-custom-provider pause     # takes all custom providers out of the config; restart OpenCode and test Zen
+opencode-custom-provider resume    # puts them back
+```
+
+If Zen still fails while paused, the cause is the OpenCode core build, not this add-on. Switch core versions with
+`install.sh`: `OPENCODE_CORE_VERSION=2.0.23` (any release that has an `opencode_X_aarch64.deb`), or `--upgrade-core`
+for the newest build published by Hope2333 (currently 2.0.27, while upstream is at 2.0.29; 2.0.29 adds recovery for
+truncated tool calls, which may matter for providers with a small output limit).
+
 ## Error: "OpenAI Chat received content after the finish reason"
 
 OpenCode 2.x is strict: if a server sends any content after a chunk that carries `finish_reason`, the reply is

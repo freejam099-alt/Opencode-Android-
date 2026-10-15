@@ -6,7 +6,7 @@
 # Steps: (1) install nodejs if neither node nor bun exists,
 #        (2) install OpenCode itself if missing (.deb from the Hope2333 GitHub release, sha256-verified),
 #        (3) install `opencode-custom-provider` + the /custom-provider slash command.
-# Flags / env: --uninstall | OPENCODE_ANDROID_SKIP_CORE=1 | OPENCODE_CORE_DEB=<file.deb> | OPENCODE_CORE_VERSION=<x.y.z> | OPENCODE_ANDROID_REF=<branch> | PREFIX=<dir>
+# Flags / env: --uninstall | --upgrade-core | OPENCODE_ANDROID_SKIP_CORE=1 | OPENCODE_CORE_DEB=<file.deb> | OPENCODE_CORE_VERSION=<x.y.z> | OPENCODE_ANDROID_REF=<branch> | PREFIX=<dir>
 set -euo pipefail
 
 REPO="${OPENCODE_ANDROID_REPO:-freejam099-alt/Opencode-Android-}"
@@ -19,7 +19,16 @@ BIN="$PREFIX/bin/opencode-custom-provider"
 log() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-if [[ "${1:-}" == "--uninstall" ]]; then
+UPGRADE_CORE="${OPENCODE_CORE_FORCE:-0}"
+UNINSTALL=0
+for arg in "$@"; do
+	case "$arg" in
+	--uninstall) UNINSTALL=1 ;;
+	--upgrade-core) UPGRADE_CORE=1 ;;
+	esac
+done
+
+if [[ "$UNINSTALL" == "1" ]]; then
 	[[ -f "$BIN" ]] && bash "$BIN" uninstall-command || true
 	rm -rf "$LIB" "$BIN"
 	log "removed opencode-custom-provider (your providers/config are kept)"
@@ -78,12 +87,18 @@ fetch(`https://api.github.com/repos/${repo}/releases?per_page=30`, { headers: { 
 	"$rt" -e "$js" "$CORE_REPO" "$want" 2>/dev/null
 }
 
+installed_core_version() {
+	command -v opencode >/dev/null 2>&1 || return 0
+	opencode --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+}
+
 install_core() {
 	local deb="${OPENCODE_CORE_DEB:-}"
 	if [[ -z "$deb" ]]; then
 		local arch="${OPENCODE_ARCH:-$(uname -m)}"
 		[[ "$arch" == "aarch64" || "$arch" == "arm64" ]] || die "unsupported CPU '$arch': the prebuilt OpenCode packages are aarch64 only"
-		local tag ver found
+		local tag ver found installed
+		installed="$(installed_core_version)"
 		if found="$(discover_core)" && [[ -n "$found" ]]; then
 			tag="${found%% *}"
 			ver="${found##* }"
@@ -94,6 +109,11 @@ install_core() {
 		else
 			core_fail
 		fi
+		if [[ -n "$installed" && "$installed" == "$ver" ]]; then
+			log "OpenCode $installed is already the newest available build ($tag)"
+			return 0
+		fi
+		[[ -n "$installed" ]] && log "OpenCode $installed -> $ver"
 		local base="https://github.com/$CORE_REPO/releases/download/$tag"
 		local name="opencode_${ver}_aarch64.deb"
 		local dl
@@ -117,8 +137,15 @@ install_core() {
 	return 0
 }
 
-if [[ "${OPENCODE_ANDROID_SKIP_CORE:-0}" != "1" ]] && ! command -v opencode >/dev/null 2>&1; then
-	install_core
+if [[ "${OPENCODE_ANDROID_SKIP_CORE:-0}" != "1" ]]; then
+	cur="$(installed_core_version)"
+	if ! command -v opencode >/dev/null 2>&1; then
+		install_core
+	elif [[ "$UPGRADE_CORE" == "1" || ( -n "${OPENCODE_CORE_VERSION:-}" && "${OPENCODE_CORE_VERSION}" != "$cur" ) ]]; then
+		install_core
+	else
+		log "OpenCode ${cur:-?} already installed (update/change it with: --upgrade-core or OPENCODE_CORE_VERSION=x.y.z)"
+	fi
 fi
 
 # 3) add-on files: local checkout if available, else download

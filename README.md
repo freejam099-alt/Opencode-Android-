@@ -42,6 +42,12 @@ Di dalam OpenCode / inside OpenCode:
 
 Pilih model sebagai `my-proxy/<model>` atau lewat `/models`. Jangan pakai `--key` di dalam OpenCode (tersimpan di riwayat sesi); pakai `--key-clipboard` / `--key-env` / wizard. Error `received content after the finish reason`? Jalankan `opencode-custom-provider diagnose <id>`, lalu `set <id> --relay on` dan mulai OpenCode dengan `opencode-custom-provider launch`. Think effort mengikuti data dari provider (`/models`), fallback tebakan dari nama model (`--reasoning` / `--no-reasoning` untuk paksa). Tanpa tool calling: `--no-tools`.
 Update: `curl -fsSL .../install.sh | bash` lagi. Uninstall: `curl -fsSL .../install.sh | bash -s -- --uninstall`.
+### Troubleshooting
+
+- **Provider/model baru tidak muncul** (walau sudah restart): jalankan `opencode-custom-provider doctor` (atau `/custom-provider doctor`). Penyebab paling umum: `enabled_providers` di config berisi daftar putih, jadi OpenCode 2.x menyembunyikan provider yang tidak terdaftar. `doctor --fix` memperbaikinya (provider baru kini otomatis dimasukkan ke daftar itu). `doctor` juga mengecek file key yang hilang, relay mati, dan server yang tidak menjawab. Server tanpa `/models`? Provider tetap ditambahkan; isi model manual: `set <id> --models a,b`.
+- **Model bawaan (Zen) tidak bisa tool call**: add-on ini tidak pernah mengubah provider `opencode` (ada pengecekan otomatis + tes). Untuk membuktikannya: `opencode-custom-provider pause`, restart OpenCode, coba Zen; lalu `opencode-custom-provider resume`. Kalau Zen tetap gagal, penyebabnya build core OpenCode-nya, bukan add-on. Coba versi lain: `curl -fsSL .../install.sh | OPENCODE_CORE_VERSION=2.0.23 bash`, atau update ke yang terbaru: `curl -fsSL .../install.sh | bash -s -- --upgrade-core`.
+- **`received content after the finish reason`**: `diagnose <id>` lalu `set <id> --relay on` (lihat atas).
+
 Detail: [docs/custom-provider.md](./docs/custom-provider.md).
 
 ## Quick install

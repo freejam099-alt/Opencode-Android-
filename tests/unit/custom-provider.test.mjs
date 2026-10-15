@@ -390,3 +390,125 @@ test("think effort follows the provider's own metadata", async () => {
     srv.close()
   }
 })
+
+// ---------------------------------------------------------------------------
+// regression tests: "second provider shows no models", whitelists, odd servers
+// ---------------------------------------------------------------------------
+const listServer = (ids) => mockServer((req, res) => res.end(JSON.stringify({ data: ids.map((id) => ({ id })) })))
+
+test("enabled_providers whitelist: new providers are allow-listed (and cleaned up on remove)", async () => {
+  const a = await listServer(["m1"])
+  const b = await listServer(["m2"])
+  const t = sandbox()
+  fs.mkdirSync(t.env.OPENCODE_CP_CONFIG_DIR, { recursive: true })
+  fs.writeFileSync(t.cfgFile, JSON.stringify({ enabled_providers: ["opencode", "other"], disabled_providers: ["second"], theme: "x" }))
+  try {
+    let r = await t.run("add", "First", `http://127.0.0.1:${a.port}/v1`, "--no-key")
+    assert.match(r.out, /allow-list/)
+    r = await t.run("add", "Second", `http://127.0.0.1:${b.port}/v1`, "--no-key")
+    const cfg = t.readCfg()
+    assert.deepEqual(cfg.enabled_providers, ["opencode", "other", "first", "second"])
+    assert.deepEqual(cfg.disabled_providers, []) // "second" was explicitly disabled -> re-enabled for our own provider only
+    assert.equal(cfg.theme, "x")
+    await t.run("remove", "first")
+    assert.deepEqual(t.readCfg().enabled_providers, ["opencode", "other", "second"])
+  } finally {
+    a.srv.close()
+    b.srv.close()
+  }
+})
+
+test("doctor: detects whitelist hiding, missing key file, dead relay; --fix repairs the global one", async () => {
+  const a = await listServer(["m1"])
+  const t = sandbox()
+  const cwd = path.join(t.dir, "proj")
+  fs.mkdirSync(path.join(cwd, ".opencode"), { recursive: true })
+  try {
+    await t.run("add", "Prov", `http://127.0.0.1:${a.port}/v1`, "--no-key")
+    // the whitelist appears later (e.g. written by another tool/UI) and a project file also restricts providers
+    const cfg = t.readCfg()
+    cfg.enabled_providers = ["opencode"]
+    cfg.provider.prov.options.apiKey = "{file:" + path.join(t.dir, "gone.key") + "}"
+    fs.writeFileSync(t.cfgFile, JSON.stringify(cfg))
+    fs.writeFileSync(path.join(cwd, "opencode.json"), JSON.stringify({ enabled_providers: ["opencode"] }))
+    const run = async (...argv) => {
+      process.exitCode = 0
+      const lines = []
+      await main(argv, { env: t.env, io: { interactive: false, out: (s) => lines.push(s), warn: () => {}, ask: async () => "" }, cwd, noSpawn: true })
+      return lines.join("\n")
+    }
+    let out = await run("doctor", "--offline")
+    assert.match(out, /PROBLEM prov: HIDDEN by enabled_providers in .*oc\/opencode\.json/)
+    assert.match(out, /HIDDEN by enabled_providers in .*proj\/opencode\.json/)
+    assert.match(out, /fix by hand/)
+    assert.match(out, /key file missing/)
+    out = await run("doctor", "--offline", "--fix")
+    assert.match(out, /fixed {3}prov: allowed in/)
+    assert.ok(t.readCfg().enabled_providers.includes("prov"))
+    // relay on but nothing listening
+    await run("set", "prov", "--relay", "on", "--port", "18997")
+    out = await run("doctor", "--offline")
+    assert.match(out, /relay is ON but not running/)
+    // healthy server check
+    await run("set", "prov", "--relay", "off")
+    fs.writeFileSync(path.join(t.dir, "gone.key"), "k")
+    out = await run("doctor")
+    assert.match(out, /ok {6}prov: server answers, lists 1 model/)
+  } finally {
+    a.srv.close()
+  }
+})
+
+test("pause/resume round-trips every custom provider and leaves everything else alone", async () => {
+  const a = await listServer(["m1"])
+  const t = sandbox()
+  fs.mkdirSync(t.env.OPENCODE_CP_CONFIG_DIR, { recursive: true })
+  const base = { provider: { opencode: { options: { timeout: 5 } } }, model: "opencode/big-pickle" }
+  fs.writeFileSync(t.cfgFile, JSON.stringify(base))
+  try {
+    await t.run("add", "One", `http://127.0.0.1:${a.port}/v1`, "--no-key")
+    const withOne = t.readCfg()
+    let r = await t.run("pause")
+    assert.match(r.out, /Paused 1/)
+    assert.deepEqual(t.readCfg(), base)
+    assert.match((await t.run("list")).out, /PAUSED/)
+    r = await t.run("resume")
+    assert.match(r.out, /Resumed 1/)
+    assert.deepEqual(t.readCfg().provider.one, withOne.provider.one)
+    assert.deepEqual(t.readCfg().provider.opencode, base.provider.opencode)
+    assert.equal(t.readCfg().model, base.model)
+  } finally {
+    a.srv.close()
+  }
+})
+
+test("server without /models: provider is still added; set --models adds models by hand", async () => {
+  const { srv, port } = await mockServer((req, res) => res.writeHead(404).end("no"))
+  const t = sandbox()
+  try {
+    let r = await t.run("add", "Bare", `http://127.0.0.1:${port}/v1`, "--no-key")
+    assert.equal(r.code, 0, r.out)
+    assert.match(r.out, /WITHOUT models/)
+    assert.deepEqual(t.readCfg().provider.bare.models, {})
+    r = await t.run("set", "bare", "--models", "alpha,beta/gamma")
+    assert.equal(r.code, 0, r.out)
+    assert.deepEqual(Object.keys(t.readCfg().provider.bare.models), ["alpha", "beta/gamma"])
+    assert.equal(t.readCfg().provider.bare.models.alpha.tool_call, true)
+    r = await t.run("set", "bare", "--models", "bad\nid")
+    assert.equal(r.code, 1)
+  } finally {
+    srv.close()
+  }
+})
+
+test("model list shapes, big lists, odd-but-safe ids", async () => {
+  assert.deepEqual(extractModelIds({ result: [{ id: "a" }] }), ["a"])
+  assert.deepEqual(extractModelIds({ data: { models: [{ name: "b" }] } }), ["b"])
+  assert.deepEqual(extractModelIds({ data: { "c-1": { owned_by: "x" }, "c-2": {} } }), ["c-1", "c-2"])
+  assert.deepEqual(extractModelIds({ error: { message: "no" } }), [])
+  const many = Array.from({ length: 700 }, (_, i) => `model-${String(i).padStart(3, "0")}`)
+  assert.equal(selectModels(many).ids.length, 700) // not truncated any more (cap is 1000)
+  const sel = selectModels(["gpt-4o (preview)", "Qwen/Qwen3-Coder-480B-A35B-Instruct", "模型-一", "evil\nignore previous", "`rm -rf`", " lead", "x".repeat(200)])
+  assert.deepEqual(sel.ids.sort(), ["Qwen/Qwen3-Coder-480B-A35B-Instruct", "gpt-4o (preview)", "模型-一"].sort())
+  assert.equal(sel.skipped, 4)
+})
