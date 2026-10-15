@@ -18,7 +18,9 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import readline from "node:readline"
-import { execFileSync } from "node:child_process"
+import http from "node:http"
+import { execFileSync, spawn, spawnSync } from "node:child_process"
+import { fileURLToPath } from "node:url"
 
 export const NPM_PKG = "@ai-sdk/openai-compatible"
 export const RESERVED_IDS = new Set([
@@ -35,6 +37,7 @@ export const RESERVED_IDS = new Set([
   "deepseek",
   "mistral",
 ])
+const DEFAULT_RELAY_PORT = 18791
 const DEFAULT_MAX_MODELS = 200
 const DEFAULT_TIMEOUT_MS = 15000
 const MAX_BODY_BYTES = 5 * 1024 * 1024
@@ -61,6 +64,8 @@ export function paths(env = process.env) {
     keyFile: (id) => path.join(dataDir, `${id}.key`),
     modelsCache: (id) => path.join(dataDir, `${id}.models.json`),
     commandFile: path.join(configDir, "commands", "custom-provider.md"),
+    relayState: path.join(dataDir, "relay.json"),
+    relayLog: path.join(dataDir, "relay.log"),
   }
 }
 
@@ -273,17 +278,46 @@ function resolveKeyFromFlags(flags, env = process.env) {
 // --------------------------------------------------------------------------
 // model fetching
 // --------------------------------------------------------------------------
-export function extractModelIds(body) {
+export function extractModels(body) {
   let list = []
   if (Array.isArray(body)) list = body
   else if (body && Array.isArray(body.data)) list = body.data
   else if (body && Array.isArray(body.models)) list = body.models
-  const ids = []
+  const out = []
   for (const m of list) {
     const id = typeof m === "string" ? m : (m?.id ?? m?.name ?? m?.model)
-    if (typeof id === "string") ids.push(id)
+    if (typeof id === "string") out.push({ id, raw: typeof m === "object" ? m : undefined })
   }
-  return ids
+  return out
+}
+export const extractModelIds = (body) => extractModels(body).map((m) => m.id)
+
+// What the PROVIDER says about a model (think effort differs per model, so we follow the provider).
+// Only explicit/positive signals are used; a missing field never disables anything.
+const EFFORT_NAMES = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+const posInt = (v) => {
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined
+}
+export function deriveMeta(raw) {
+  if (!raw || typeof raw !== "object") return {}
+  const caps = raw.capabilities && typeof raw.capabilities === "object" ? raw.capabilities : {}
+  const sp = Array.isArray(raw.supported_parameters) ? raw.supported_parameters : undefined
+  const bool = (...vs) => vs.find((v) => typeof v === "boolean")
+  const effortSrc = [raw.reasoning_efforts, raw.supported_reasoning_efforts, raw.reasoning_effort_options, caps.reasoning_efforts].find(Array.isArray)
+  const efforts = effortSrc?.map((e) => String(e).toLowerCase()).filter((e) => EFFORT_NAMES.includes(e))
+  let reasoning = bool(raw.reasoning, raw.supports_reasoning, raw.thinking, caps.reasoning, caps.thinking, caps.supports_reasoning)
+  if (reasoning === undefined && sp?.some((p) => /^(reasoning|include_reasoning|reasoning_effort)$/.test(p))) reasoning = true
+  if (reasoning === undefined && efforts?.length) reasoning = true
+  let tools = bool(raw.supports_function_calling, raw.supports_tool_calls, raw.tool_call, caps.tools, caps.function_calling, caps.tool_call)
+  if (tools === undefined && sp?.includes("tools")) tools = true
+  return {
+    reasoning,
+    efforts: efforts?.length ? [...new Set(efforts)] : undefined,
+    tools,
+    context: posInt(raw.context_length ?? raw.context_window ?? raw.max_context_length ?? raw.max_input_tokens ?? caps.context_length),
+    output: posInt(raw.max_output_tokens ?? raw.max_completion_tokens ?? raw.top_provider?.max_completion_tokens ?? caps.max_output_tokens),
+  }
 }
 
 export function selectModels(ids, { filter, max = DEFAULT_MAX_MODELS } = {}) {
@@ -338,7 +372,7 @@ async function fetchJson(url, key, headers, timeoutMs, fetchImpl) {
   }
 }
 
-// Returns { baseURL, ids } -- baseURL may be corrected (adds /v1 if that is what works).
+// Returns { baseURL, ids, meta } -- baseURL may be corrected (adds /v1 if that is what works).
 export async function fetchModels(baseURL, key, { headers = {}, timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl = globalThis.fetch } = {}) {
   const candidates = [baseURL]
   if (!/\/v\d+$/.test(baseURL)) candidates.push(`${baseURL}/v1`)
@@ -347,8 +381,8 @@ export async function fetchModels(baseURL, key, { headers = {}, timeoutMs = DEFA
     const r = await fetchJson(`${base}/models`, key, headers, timeoutMs, fetchImpl)
     lastStatus = r.status
     if (r.body) {
-      const ids = extractModelIds(r.body)
-      if (ids.length) return { baseURL: base, ids }
+      const models = extractModels(r.body)
+      if (models.length) return { baseURL: base, ids: models.map((m) => m.id), meta: new Map(models.map((m) => [m.id, deriveMeta(m.raw)])) }
       continue
     }
     if (r.status === 401 || r.status === 403) fail(`Authentication failed (HTTP ${r.status}). Check the API key.`)
@@ -369,22 +403,32 @@ const REASONING_RE = /(^|[/:_-])(o[134](-|$)|gpt-5|gpt-oss|r1(-|$)|reasoner|qwq|
 export const looksReasoning = (id) => REASONING_RE.test(id)
 const reasoningFor = (id, mode) => (mode === "on" ? true : mode === "off" ? false : looksReasoning(id))
 
-// New models get `tool_call: true` (agentic tool use) unless --no-tools, and `reasoning: true`
-// (enables think-effort variants) per the reasoning mode. Existing entries are preserved; missing
-// `reasoning`/`tool_call` keys are filled in, anything the user set explicitly is never overwritten.
-function buildModelsMap(existing, ids, { tools = true, reasoning = "auto" } = {}) {
-  const fresh = (id) => ({ name: id, ...(tools ? { tool_call: true } : {}), ...(reasoningFor(id, reasoning) ? { reasoning: true } : {}) })
+// New models get `tool_call: true` (agentic tool use) unless --no-tools. Think effort follows the provider:
+//   provider metadata (explicit reasoning flag / effort list)  >  model-id heuristic  >  nothing.
+// Existing entries are preserved; only MISSING keys are filled, anything the user set is never overwritten.
+function buildModelsMap(existing, ids, { tools = true, reasoning = "auto", meta = new Map() } = {}) {
+  const fill = (entry, id) => {
+    const m = meta.get(id) || {}
+    const reasons = reasoning === "on" ? true : reasoning === "off" ? false : (m.reasoning ?? looksReasoning(id))
+    if (entry.tool_call === undefined && tools) entry.tool_call = m.tools === false ? false : true
+    if (entry.reasoning === undefined) {
+      if (reasons) entry.reasoning = true
+      else if (reasoning === "auto" && m.reasoning === false) entry.reasoning = false // provider said so explicitly
+    }
+    if (entry.variants === undefined) {
+      if (entry.reasoning === true && m.efforts && reasoning !== "off") entry.variants = Object.fromEntries(m.efforts.map((e) => [e, { reasoningEffort: e }]))
+      else if (reasoning === "auto" && m.reasoning === false) entry.variants = {} // no effort variants for non-reasoning models
+    }
+    if (entry.limit === undefined && m.context && m.output) entry.limit = { context: m.context, output: Math.min(m.output, m.context) }
+    return entry
+  }
   const map = {}
   for (const id of ids) {
     const cur = existing?.[id]
-    if (cur && typeof cur === "object") {
-      map[id] = { ...cur }
-      if (map[id].reasoning === undefined && reasoningFor(id, reasoning)) map[id].reasoning = true
-      if (map[id].tool_call === undefined && tools) map[id].tool_call = true
-    } else map[id] = fresh(id)
+    map[id] = fill(cur && typeof cur === "object" ? { ...cur } : { name: id }, id)
   }
-  // keep user-customised entries (anything beyond name/tool_call/reasoning) even if the server dropped them
-  for (const [id, v] of Object.entries(existing || {})) if (!(id in map) && v && Object.keys(v).some((k) => !["name", "tool_call", "reasoning"].includes(k))) map[id] = v
+  // keep user-customised entries (anything beyond what this tool generates) even if the server dropped them
+  for (const [id, v] of Object.entries(existing || {})) if (!(id in map) && v && Object.keys(v).some((k) => !["name", "tool_call", "reasoning", "variants", "limit"].includes(k))) map[id] = v
   return map
 }
 
@@ -400,10 +444,10 @@ function parseHeaders(list) {
   return out
 }
 
-function describe(id, entry, P) {
+function describe(id, entry, P, reg) {
   const n = Object.keys(entry.models || {}).length
   const key = readKey(P, id)
-  return `${id}  "${entry.name}"  ${entry.options?.baseURL}  models=${n}  key=${key ? "set" : "none"}`
+  return `${id}  "${entry.name}"  ${entry.options?.baseURL}  models=${n}  key=${key ? "set" : "none"}${reg?.providers?.[id]?.upstream ? "  relay=on" : ""}`
 }
 
 export async function cmdAdd(P, args, flags, io, deps = {}) {
@@ -436,6 +480,7 @@ export async function cmdAdd(P, args, flags, io, deps = {}) {
   if (keyInfo.viaArgv) io.warn("Key was passed on the command line. Inside OpenCode that lands in your session history and is sent to the model provider. Prefer --key-env, --key-file, --key-clipboard or the interactive wizard.")
 
   let ids = []
+  let meta = new Map()
   let info = ""
   if (flags.models) {
     ids = String(flags.models).split(",").map((s) => s.trim()).filter(Boolean)
@@ -445,6 +490,7 @@ export async function cmdAdd(P, args, flags, io, deps = {}) {
     baseURL = r.baseURL
     const sel = selectModels(r.ids, { filter: flags.filter, max: num(flags.max, "max", DEFAULT_MAX_MODELS) })
     ids = sel.ids
+    meta = r.meta
     info += modelSummary(sel)
     fs.mkdirSync(P.dataDir, { recursive: true })
     atomicWrite(P.modelsCache(id), JSON.stringify({ fetchedAt: new Date().toISOString(), ids: r.ids.filter((x) => MODEL_ID_RE.test(x)) }) + "\n")
@@ -461,7 +507,7 @@ export async function cmdAdd(P, args, flags, io, deps = {}) {
       ...(key ? { apiKey: `{file:${tildePath(P, P.keyFile(id))}}` } : {}),
       ...(Object.keys(headers).length ? { headers } : {}),
     },
-    models: buildModelsMap(existingEntry?.models, ids, { tools: !flags["no-tools"], reasoning: reasoningMode(flags) }),
+    models: buildModelsMap(existingEntry?.models, ids, { tools: !flags["no-tools"], reasoning: reasoningMode(flags), meta }),
   }
   if (!key) delete entry.options.apiKey
   try {
@@ -497,11 +543,11 @@ export async function cmdModels(P, args, flags, io, deps = {}) {
   if (!wanted.length) fail("No custom providers yet. Add one with: add <name> <baseURL>")
   for (const id of wanted) if (!reg.providers[id] || !loaded.cfg.provider?.[id]) fail(`Unknown custom provider "${id}". Run "list".`)
 
-  // fetch in parallel; apply sequentially
+  // fetch in parallel (always from the real upstream, never through the relay); apply sequentially
   const results = await Promise.allSettled(
     wanted.map(async (id) => {
       const entry = loaded.cfg.provider[id]
-      const r = await fetchModels(entry.options.baseURL, readKey(P, id), {
+      const r = await fetchModels(reg.providers[id].upstream || entry.options.baseURL, readKey(P, id), {
         headers: entry.options.headers || {},
         timeoutMs: num(flags.timeout, "timeout", DEFAULT_TIMEOUT_MS / 1000) * 1000,
         fetchImpl: deps.fetchImpl,
@@ -518,24 +564,32 @@ export async function cmdModels(P, args, flags, io, deps = {}) {
 
   const lines = []
   const save = flags["dry-run"] ? (_P, l, m) => m(JSON.parse(JSON.stringify(l.cfg))) : saveConfig
+  let regChanged = false
   save(P, loaded, (cfg) => {
     for (const { id, r } of updates) {
       const entry = cfg.provider[id]
       const sel = selectModels(r.ids, { filter: flags.filter, max: num(flags.max, "max", DEFAULT_MAX_MODELS) })
       const before = Object.keys(entry.models || {})
       if (!flags["dry-run"]) {
-        entry.options.baseURL = r.baseURL
-        entry.models = buildModelsMap(entry.models, sel.ids, { tools: !flags["no-tools"], reasoning: reasoningMode(flags) })
+        if (reg.providers[id].upstream) {
+          if (reg.providers[id].upstream !== r.baseURL) {
+            reg.providers[id].upstream = r.baseURL
+            regChanged = true
+          }
+        } else entry.options.baseURL = r.baseURL
+        entry.models = buildModelsMap(entry.models, sel.ids, { tools: !flags["no-tools"], reasoning: reasoningMode(flags), meta: r.meta })
         fs.mkdirSync(P.dataDir, { recursive: true })
         atomicWrite(P.modelsCache(id), JSON.stringify({ fetchedAt: new Date().toISOString(), ids: r.ids.filter((x) => MODEL_ID_RE.test(x)) }) + "\n")
       }
       const after = Object.keys(flags["dry-run"] ? Object.fromEntries(sel.ids.map((x) => [x, 1])) : entry.models)
       const added = after.filter((x) => !before.includes(x)).length
       const removed = before.filter((x) => !after.includes(x)).length
-      lines.push(`${id}: ${after.length} model(s) (+${added} / -${removed})${sel.truncated ? " [truncated; use --filter]" : ""}${sel.skipped ? ` [${sel.skipped} unsafe ids skipped]` : ""}`)
+      const reasoningCount = flags["dry-run"] ? "?" : Object.values(entry.models).filter((m) => m.reasoning === true).length
+      lines.push(`${id}: ${after.length} model(s) (+${added} / -${removed}), reasoning=${reasoningCount}${sel.truncated ? " [truncated; use --filter]" : ""}${sel.skipped ? ` [${sel.skipped} unsafe ids skipped]` : ""}`)
       if (flags.list || flags["dry-run"]) lines.push(...sel.ids.map((x) => `  - ${x}`))
     }
   }, updates.map((u) => u.id))
+  if (regChanged) saveRegistry(P, reg)
   io.out(lines.join("\n") + (flags["dry-run"] ? "\n(dry run: nothing written)" : "\nRestart OpenCode to reload models."))
 }
 
@@ -544,7 +598,7 @@ export function cmdList(P, io) {
   const loaded = loadConfig(P)
   const ids = Object.keys(reg.providers).filter((id) => loaded.cfg.provider?.[id])
   if (!ids.length) return io.out("No custom providers. Add one: add <name> <baseURL> [--key-env VAR]")
-  io.out(ids.map((id) => describe(id, loaded.cfg.provider[id], P)).join("\n"))
+  io.out(ids.map((id) => describe(id, loaded.cfg.provider[id], P, reg)).join("\n"))
 }
 
 export async function cmdSet(P, args, flags, io, deps = {}) {
@@ -552,15 +606,34 @@ export async function cmdSet(P, args, flags, io, deps = {}) {
   const reg = loadRegistry(P)
   const loaded = loadConfig(P)
   if (!id || !reg.providers[id] || !loaded.cfg.provider?.[id]) fail(`Unknown custom provider "${args[0] || ""}". Run "list".`)
+  const relay = flags.relay === undefined ? undefined : String(flags.relay).toLowerCase()
+  if (relay !== undefined && relay !== "on" && relay !== "off") fail("--relay must be on or off")
   const keyInfo = resolveKeyFromFlags(flags, deps.env)
   if (keyInfo.viaArgv) io.warn("Key was passed on the command line (it ends up in shell/session history). Prefer --key-env / --key-file / --key-clipboard.")
   let newKey = keyInfo.key
-  if (newKey === undefined && !keyInfo.none && !flags.name && !flags["base-url"] && !flags.header && io.interactive) newKey = await io.ask("New API key (hidden, empty to keep): ", { hidden: true })
+  if (newKey === undefined && !keyInfo.none && !flags.name && !flags["base-url"] && !flags.header && relay === undefined && io.interactive) newKey = await io.ask("New API key (hidden, empty to keep): ", { hidden: true })
   const headers = flags.header ? parseHeaders(flags.header) : null
+  const regEntry = reg.providers[id]
+  const newBase = flags["base-url"] ? normalizeBaseURL(flags["base-url"]) : undefined
+  reg.relay = reg.relay || { port: num(flags.port, "port", DEFAULT_RELAY_PORT) }
   saveConfig(P, loaded, (cfg) => {
     const e = cfg.provider[id]
     if (flags.name) e.name = String(flags.name)
-    if (flags["base-url"]) e.options.baseURL = normalizeBaseURL(flags["base-url"])
+    // upstream = the real server. While the relay is on, config points at the relay instead.
+    let upstream = regEntry.upstream
+    if (newBase) {
+      if (upstream) upstream = newBase
+      else e.options.baseURL = newBase
+    }
+    if (relay === "on") {
+      upstream = upstream || e.options.baseURL
+      e.options.baseURL = relayURL(reg, id)
+    } else if (relay === "off" && upstream) {
+      e.options.baseURL = upstream
+      upstream = undefined
+    }
+    if (upstream) regEntry.upstream = upstream
+    else delete regEntry.upstream
     if (headers) e.options.headers = { ...(e.options.headers || {}), ...headers }
     if (keyInfo.none) {
       delete e.options.apiKey
@@ -570,11 +643,14 @@ export async function cmdSet(P, args, flags, io, deps = {}) {
     }
   }, [id])
   if (keyInfo.none && fs.existsSync(P.keyFile(id))) fs.rmSync(P.keyFile(id))
-  if (flags.name) {
-    reg.providers[id].name = String(flags.name)
-    saveRegistry(P, reg)
+  if (flags.name) regEntry.name = String(flags.name)
+  saveRegistry(P, reg)
+  let msg = `Updated "${id}". ` + (newBase ? "Run: models " + id + "  to refresh the model list. " : "") + "Restart OpenCode to apply."
+  if (relay === "on") {
+    msg += `\nRelay is ON for "${id}" (fixes servers that stream content after finish_reason). ` + (deps.noSpawn ? "" : await ensureRelay(P, io))
+    msg += `\nStart OpenCode with: opencode-custom-provider launch   (starts the relay automatically)`
   }
-  io.out(`Updated "${id}". ` + (flags["base-url"] ? "Run: models " + id + "  to refresh the model list. " : "") + "Restart OpenCode to apply.")
+  io.out(msg)
 }
 
 export function cmdRemove(P, args, flags, io) {
@@ -592,6 +668,272 @@ export function cmdRemove(P, args, flags, io) {
   delete reg.providers[id]
   saveRegistry(P, reg)
   io.out(`Removed "${id}" (config entry, key file, model cache). OpenCode Zen and other providers are untouched.`)
+}
+
+// --------------------------------------------------------------------------
+// stream relay: fixes servers that send content AFTER finish_reason
+// --------------------------------------------------------------------------
+// OpenCode 2.x rejects such streams ("OpenAI Chat received content after the finish reason").
+// The relay (127.0.0.1 only) forwards requests unchanged but holds back finish_reason and emits it
+// once, just before [DONE]. It never reads API keys: OpenCode sends the Authorization header itself.
+export function createSSENormalizer() {
+  let buf = ""
+  let pending = null
+  let meta = {}
+  const finishChunk = () => {
+    const chunk = { id: meta.id ?? "relay", object: "chat.completion.chunk", created: meta.created ?? Math.floor(Date.now() / 1000), model: meta.model ?? "", choices: [{ index: 0, delta: {}, finish_reason: pending.finish_reason }] }
+    if (pending.native_finish_reason !== undefined) chunk.choices[0].native_finish_reason = pending.native_finish_reason
+    pending = null
+    return `data: ${JSON.stringify(chunk)}\n\n`
+  }
+  const event = (raw) => {
+    const lines = raw.split("\n")
+    const di = lines.findIndex((l) => l.startsWith("data:"))
+    if (di < 0) return raw + "\n\n"
+    const data = lines[di].slice(5).trim()
+    if (data === "[DONE]") return (pending ? finishChunk() : "") + raw + "\n\n"
+    let obj
+    try {
+      obj = JSON.parse(data)
+    } catch {
+      return raw + "\n\n"
+    }
+    if (obj && typeof obj === "object") {
+      for (const k of ["id", "created", "model"]) if (obj[k] !== undefined) meta[k] = obj[k]
+      const c = obj.choices?.[0]
+      if (c && c.finish_reason) {
+        pending = { finish_reason: c.finish_reason, native_finish_reason: c.native_finish_reason }
+        c.finish_reason = null
+        delete c.native_finish_reason
+        lines[di] = "data: " + JSON.stringify(obj)
+        return lines.join("\n") + "\n\n"
+      }
+    }
+    return raw + "\n\n"
+  }
+  return {
+    push(text) {
+      buf += text.replace(/\r\n/g, "\n")
+      let out = ""
+      let i
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const raw = buf.slice(0, i)
+        buf = buf.slice(i + 2)
+        if (raw.trim()) out += event(raw)
+      }
+      return out
+    },
+    end() {
+      let out = buf.trim() ? event(buf.trim()) : ""
+      buf = ""
+      if (pending) out += finishChunk()
+      return out
+    },
+  }
+}
+
+const HOP = new Set(["connection", "keep-alive", "transfer-encoding", "content-length", "content-encoding", "host", "accept-encoding", "upgrade", "te", "trailer"])
+
+export function startRelay({ port = DEFAULT_RELAY_PORT, host = "127.0.0.1", getUpstream, fetchImpl = globalThis.fetch }) {
+  const server = http.createServer(async (req, res) => {
+    const ctl = new AbortController()
+    res.on("close", () => ctl.abort())
+    try {
+      if (req.url === "/health") return void res.writeHead(200, { "content-type": "text/plain" }).end("ok")
+      const m = /^\/([a-z0-9-]+)(\/.*)?$/.exec(req.url || "")
+      const upstream = m && getUpstream(m[1])
+      if (!upstream) return void res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "unknown relay provider" } }))
+      const chunks = []
+      let size = 0
+      for await (const c of req) {
+        size += c.length
+        if (size > 25 * 1024 * 1024) return void res.writeHead(413).end()
+        chunks.push(c)
+      }
+      const headers = {}
+      for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k) && typeof v === "string") headers[k] = v
+      headers["accept-encoding"] = "identity"
+      const hasBody = !["GET", "HEAD"].includes(req.method)
+      const up = await fetchImpl(upstream + (m[2] || ""), { method: req.method, headers, body: hasBody ? Buffer.concat(chunks) : undefined, signal: ctl.signal })
+      const out = {}
+      up.headers.forEach((v, k) => {
+        if (!HOP.has(k)) out[k] = v
+      })
+      res.writeHead(up.status, out)
+      const stream = (up.headers.get("content-type") || "").includes("text/event-stream")
+      const norm = stream ? createSSENormalizer() : null
+      const dec = new TextDecoder()
+      if (up.body) {
+        for await (const chunk of up.body) {
+          if (norm) {
+            const t = norm.push(dec.decode(chunk, { stream: true }))
+            if (t) res.write(t)
+          } else res.write(chunk)
+        }
+      }
+      if (norm) {
+        const t = norm.end()
+        if (t) res.write(t)
+      }
+      res.end()
+    } catch (e) {
+      if (ctl.signal.aborted) return
+      if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" })
+      res.end(JSON.stringify({ error: { message: `relay: upstream error: ${e?.cause?.code || e?.message || e}` } }))
+    }
+  })
+  return new Promise((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(port, host, () => resolve({ server, port: server.address().port }))
+  })
+}
+
+const relayURL = (reg, id) => `http://127.0.0.1:${reg.relay?.port || DEFAULT_RELAY_PORT}/${id}`
+
+function relayAlive(P) {
+  const st = readJson(P.relayState, null)
+  if (!st?.pid) return null
+  try {
+    process.kill(st.pid, 0)
+    return st
+  } catch {
+    return null
+  }
+}
+
+async function relayHealthy(port) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) })
+    return r.ok
+  } catch {
+    return false
+  }
+}
+
+export async function ensureRelay(P, io) {
+  const reg = loadRegistry(P)
+  const port = reg.relay?.port || DEFAULT_RELAY_PORT
+  if (relayAlive(P) && (await relayHealthy(port))) return `Relay already running on 127.0.0.1:${port}.`
+  fs.mkdirSync(P.dataDir, { recursive: true })
+  const log = fs.openSync(P.relayLog, "w")
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "relay", "run", "--port", String(port)], { detached: true, stdio: ["ignore", log, log] })
+  child.unref()
+  atomicWrite(P.relayState, JSON.stringify({ pid: child.pid, port }) + "\n")
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 150))
+    if (await relayHealthy(port)) return `Relay started on 127.0.0.1:${port}.`
+  }
+  fail(`Relay did not start (see ${P.relayLog}). Is port ${port} in use? Try: relay start --port 18792`)
+}
+
+async function cmdRelay(P, args, flags, io, deps = {}) {
+  const sub = args[0] || "status"
+  const reg = loadRegistry(P)
+  if (flags.port) {
+    reg.relay = { port: num(flags.port, "port") }
+    saveRegistry(P, reg)
+  }
+  const port = reg.relay?.port || DEFAULT_RELAY_PORT
+  if (sub === "run") {
+    const r = await startRelay({ port, getUpstream: (id) => loadRegistry(P).providers[id]?.upstream })
+    console.log(`relay listening on 127.0.0.1:${r.port}`)
+    return new Promise(() => {}) // keep serving
+  }
+  if (sub === "start") return io.out(await ensureRelay(P, io))
+  if (sub === "stop") {
+    const st = relayAlive(P)
+    if (st) process.kill(st.pid)
+    fs.rmSync(P.relayState, { force: true })
+    return io.out(st ? "Relay stopped." : "Relay was not running.")
+  }
+  if (sub === "status") {
+    const up = Object.entries(reg.providers).filter(([, v]) => v.upstream).map(([k]) => k)
+    return io.out(`relay: ${relayAlive(P) && (await relayHealthy(port)) ? "running" : "stopped"} (127.0.0.1:${port}); providers using it: ${up.join(", ") || "none"}`)
+  }
+  fail(`Unknown relay command "${sub}" (start | stop | status | run)`)
+}
+
+// Start the relay if any provider needs it, then run opencode with the remaining args.
+function cmdLaunch(P, rest, io) {
+  const reg = loadRegistry(P)
+  const needs = Object.values(reg.providers).some((v) => v.upstream)
+  const go = () => {
+    const r = spawnSync("opencode", rest, { stdio: "inherit" })
+    if (r.error) {
+      io.out(`error: cannot run opencode: ${r.error.message}`)
+      return (process.exitCode = 127)
+    }
+    process.exitCode = r.status ?? 1
+  }
+  if (!needs) return go()
+  return ensureRelay(P, io).then(go)
+}
+
+// --------------------------------------------------------------------------
+// diagnose: does this server stream content after finish_reason?
+// --------------------------------------------------------------------------
+export function analyzeStream(text) {
+  let finishedAt = -1
+  let late = 0
+  let events = 0
+  let content = 0
+  for (const block of text.replace(/\r\n/g, "\n").split("\n\n")) {
+    const line = block.split("\n").find((l) => l.startsWith("data:"))
+    if (!line) continue
+    const data = line.slice(5).trim()
+    if (data === "[DONE]") continue
+    let obj
+    try {
+      obj = JSON.parse(data)
+    } catch {
+      continue
+    }
+    events++
+    const c = obj.choices?.[0]
+    const d = c?.delta || {}
+    const has = Boolean(d.content || d.refusal || d.reasoning_content || d.reasoning || (d.tool_calls || []).some((t) => t.id || t.function?.name || t.function?.arguments))
+    if (has) content++
+    if (finishedAt >= 0 && has) late++
+    if (c?.finish_reason && finishedAt < 0) finishedAt = events
+  }
+  return { events, content, finishedAt, late }
+}
+
+async function cmdDiagnose(P, args, flags, io, deps = {}) {
+  const id = slugify(args[0] || "")
+  const reg = loadRegistry(P)
+  const loaded = loadConfig(P)
+  const entry = loaded.cfg.provider?.[id]
+  if (!id || !reg.providers[id] || !entry) fail(`Unknown custom provider "${args[0] || ""}". Run "list".`)
+  const model = flags.model || Object.keys(entry.models || {})[0]
+  if (!model) fail("No model to test. Pass --model <id>.")
+  const base = reg.providers[id].upstream || entry.options.baseURL
+  const key = readKey(P, id)
+  const fetchImpl = deps.fetchImpl || globalThis.fetch
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), num(flags.timeout, "timeout", 30) * 1000)
+  let res
+  let text
+  try {
+    res = await fetchImpl(`${base}/chat/completions`, {
+      method: "POST",
+      signal: ctl.signal,
+      headers: { "content-type": "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}), ...(entry.options.headers || {}) },
+      body: JSON.stringify({ model, stream: true, stream_options: { include_usage: true }, max_tokens: 64, messages: [{ role: "user", content: "Say hello in five words." }] }),
+    })
+    text = await res.text()
+  } catch (e) {
+    fail(`Request failed: ${e?.name === "AbortError" ? "timeout" : e?.cause?.code || e?.message}`)
+  } finally {
+    clearTimeout(timer)
+  }
+  if (!res.ok) fail(`Server answered HTTP ${res.status} for model "${model}". ${text.slice(0, 200).replace(/\s+/g, " ")}`)
+  const a = analyzeStream(text)
+  if (!a.events) fail(`Not an OpenAI-style event stream (no JSON chunks). First bytes: ${text.slice(0, 120).replace(/\s+/g, " ")}`)
+  io.out(`model=${model}  chunks=${a.events}  content-chunks=${a.content}  finish_reason first seen at chunk ${a.finishedAt > 0 ? a.finishedAt : "never"}`)
+  if (a.late > 0) io.out(`PROBLEM: ${a.late} content chunk(s) arrive AFTER finish_reason. OpenCode 2.x aborts with "received content after the finish reason".\nFix: opencode-custom-provider set ${id} --relay on   then start with: opencode-custom-provider launch`)
+  else if (a.finishedAt < 0) io.out("WARNING: the stream never sent finish_reason. OpenCode may treat the reply as unfinished.")
+  else io.out("OK: stream order is valid; the relay is not needed for this model.")
 }
 
 // --------------------------------------------------------------------------
@@ -648,6 +990,9 @@ export const HELP = `opencode-custom-provider -- OpenAI-compatible custom provid
   models [id ...|--all] [options]  re-fetch the model list (--list to print, --dry-run to preview)
   set <id> [options]               change --name / --base-url / key / --header
   remove <id>                      delete provider, key file and model cache
+  diagnose <id> [--model M]        test the stream order of a provider (finds "content after finish reason")
+  set <id> --relay on|off          local relay that fixes servers streaming content after finish_reason
+  relay start|stop|status          manage the relay;  launch [opencode args]  starts relay + opencode
   install-command | uninstall-command
                                    add/remove the /custom-provider slash command
 
@@ -693,6 +1038,7 @@ export async function main(argv, deps = {}) {
   const P = paths(deps.env || process.env)
   const io = deps.io || makeIO()
   try {
+    if (argv[0] === "launch") return await cmdLaunch(P, argv.slice(1), io)
     const { args, flags } = parseArgs(argv)
     const cmd = args.shift()
     if (!cmd) {
@@ -707,6 +1053,8 @@ export async function main(argv, deps = {}) {
       case "models": case "fetch": case "refresh": return await cmdModels(P, args, flags, io, deps)
       case "set": case "edit": return await cmdSet(P, args, flags, io, deps)
       case "remove": case "rm": case "delete": return cmdRemove(P, args, flags, io)
+      case "relay": return await cmdRelay(P, args, flags, io, deps)
+      case "diagnose": case "doctor": return await cmdDiagnose(P, args, flags, io, deps)
       case "install-command": return cmdInstallCommand(P, io)
       case "uninstall-command": return cmdUninstallCommand(P, io)
       default: fail(`Unknown command "${cmd}".\n\n${HELP}`)

@@ -44,7 +44,31 @@ Key sources: `--key-env VAR`, `--key-file PATH`, `--key-clipboard` (Termux:API),
 `--key VALUE`. **Avoid `--key` inside OpenCode**: slash-command arguments are saved in the session
 and sent to the active model. `--no-key` for local servers.
 
+## Error: "OpenAI Chat received content after the finish reason"
+
+OpenCode 2.x is strict: if a server sends any content after a chunk that carries `finish_reason`, the reply is
+cut off with this error (seen with some Kimi/Moonshot proxies). Check your provider:
+
+```bash
+opencode-custom-provider diagnose my-proxy            # sends one tiny streaming request and inspects chunk order
+opencode-custom-provider set my-proxy --relay on      # if it reports PROBLEM
+opencode-custom-provider launch                       # starts the local relay, then runs opencode
+```
+
+The relay listens on `127.0.0.1` only, forwards everything unchanged and just moves `finish_reason` to the end of
+the stream. It never reads your API key (OpenCode sends the Authorization header itself); `models`/`diagnose`
+always talk to the real server. Handy alias: `alias oc='opencode-custom-provider launch'`.
+`relay status|start|stop` manage it; `set my-proxy --relay off` removes it. If you start `opencode` directly while
+the relay is on and it is not running, you get "connection refused" -- run `relay start` or use `launch`.
+
 ## Think effort (reasoning)
+
+Think effort differs per model, so it follows what the **provider** reports in `/models` when available:
+`reasoning`/`supports_reasoning`/`capabilities.reasoning`, OpenRouter-style `supported_parameters` (`reasoning`,
+`reasoning_effort`), and effort lists (`reasoning_efforts`, ...) which become per-model `variants`
+(`{ "low": { "reasoningEffort": "low" } }`). A provider that explicitly says `reasoning: false` gets no effort
+variants. Context/output limits are filled in when the provider reports them. If the provider says nothing,
+the model-id guess below applies.
 
 Models are written with `reasoning: true` when the id looks like a reasoning model (o1/o3/o4, gpt-5, gpt-oss,
 deepseek-r1/reasoner/v3/v4, qwq, qwen3, *-thinking, glm-4.5+, kimi-k2, grok-3/4, claude opus/sonnet, gemini 2.5/3, ...).
