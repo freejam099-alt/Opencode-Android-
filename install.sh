@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/freejam099-alt/Opencode-Android-/main/install.sh | bash
 #
-# Steps: (1) install OpenCode itself if missing (same upstream installer as before),
+# Steps: (1) install OpenCode itself if missing (Hope2333 Termux package repo installer),
 #        (2) install nodejs if neither node nor bun exists,
 #        (3) install `opencode-custom-provider` + the /custom-provider slash command.
 # Flags / env: --uninstall | OPENCODE_ANDROID_SKIP_CORE=1 | OPENCODE_ANDROID_REF=<branch> | PREFIX=<dir>
@@ -26,10 +26,21 @@ if [[ "${1:-}" == "--uninstall" ]]; then
 	exit 0
 fi
 
-# 1) OpenCode core (skipped if already installed)
+# 1) OpenCode core (skipped if already installed). Termux build comes from the Hope2333 package repo.
+CORE_URL="${OPENCODE_CORE_INSTALLER:-https://hope2333.github.io/repo/install.sh}"
 if [[ "${OPENCODE_ANDROID_SKIP_CORE:-0}" != "1" ]] && ! command -v opencode >/dev/null 2>&1; then
-	log "installing OpenCode (upstream installer)"
-	curl -fsSL https://opencode.ai/install.sh | bash
+	log "installing OpenCode core via $CORE_URL"
+	if ! curl -fsSL "$CORE_URL" | sh -s -- --install opencode; then
+		cat >&2 <<'MSG'
+
+error: could not install the OpenCode core package.
+Install it manually, then run this script again (it skips the core when `opencode` already exists):
+  1) open https://github.com/Hope2333/opencode-termux/releases
+  2) download opencode_<version>_aarch64.deb (v2 mainline)
+  3) dpkg -i ~/storage/downloads/opencode_<version>_aarch64.deb
+MSG
+		exit 1
+	fi
 fi
 
 # 2) JS runtime for the provider manager

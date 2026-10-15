@@ -19,7 +19,7 @@ pkg install -y curl
 curl -fsSL https://raw.githubusercontent.com/freejam099-alt/Opencode-Android-/main/install.sh | bash
 ```
 
-Skrip ini (sama seperti cara lama: satu `curl | bash`) memasang OpenCode bila belum ada, `nodejs` bila belum ada, lalu `opencode-custom-provider` + command `/custom-provider`. Restart OpenCode setelahnya.
+Skrip ini (sama seperti cara lama: satu `curl | bash`) memasang OpenCode inti bila belum ada (lewat installer repo Hope2333: `curl -fsSL https://hope2333.github.io/repo/install.sh | sh -s -- --install opencode`), `nodejs` bila belum ada, lalu `opencode-custom-provider` + command `/custom-provider`. Restart OpenCode setelahnya.
 
 ### Pakai / Usage
 
@@ -46,7 +46,7 @@ Detail: [docs/custom-provider.md](./docs/custom-provider.md).
 ## Quick install
 
 ```bash
-curl -fsSL https://opencode.ai/install.sh | bash
+curl -fsSL https://hope2333.github.io/repo/install.sh | sh -s -- --install opencode
 ```
 
 This installs the `opencode` command. After installation, upgrade via package manager:
