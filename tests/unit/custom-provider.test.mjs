@@ -21,7 +21,9 @@ function sandbox() {
   const io = { interactive: false, out: (s) => lines.push(s), warn: (s) => lines.push("WARN " + s), ask: async () => "" }
   const run = async (...argv) => {
     process.exitCode = 0
-    await main(argv, { env, io })
+    // most tests assert the real baseURL, so they opt out of the default-on relay; relay tests opt in with --relay-default
+    const args = argv[0] === "add" && !argv.includes("--relay-default") ? [argv[0], "--no-relay", ...argv.slice(1)] : argv.filter((x) => x !== "--relay-default")
+    await main(args, { env, io, noSpawn: true })
     const code = process.exitCode
     process.exitCode = 0
     return { out: lines.splice(0).join("\n"), code }
@@ -511,4 +513,31 @@ test("model list shapes, big lists, odd-but-safe ids", async () => {
   const sel = selectModels(["gpt-4o (preview)", "Qwen/Qwen3-Coder-480B-A35B-Instruct", "模型-一", "evil\nignore previous", "`rm -rf`", " lead", "x".repeat(200)])
   assert.deepEqual(sel.ids.sort(), ["Qwen/Qwen3-Coder-480B-A35B-Instruct", "gpt-4o (preview)", "模型-一"].sort())
   assert.equal(sel.skipped, 4)
+})
+
+test("relay is ON by default for new providers; relay all/none converts existing ones", async () => {
+  const a = await listServer(["m1"])
+  const t = sandbox()
+  const up = `http://127.0.0.1:${a.port}/v1`
+  try {
+    let r = await t.run("add", "Auto", up, "--no-key", "--relay-default")
+    assert.equal(r.code, 0, r.out)
+    assert.match(r.out, /launch/)
+    assert.match(t.readCfg().provider.auto.options.baseURL, /^http:\/\/127\.0\.0\.1:18791\/auto$/)
+    assert.match((await t.run("list")).out, /relay=on/)
+    // models refresh still uses the real server
+    assert.match((await t.run("models", "auto")).out, /1 model/)
+    // an old provider without relay is converted by "relay all"; "relay none" restores real URLs
+    await t.run("add", "Old", up, "--no-key")
+    assert.equal(t.readCfg().provider.old.options.baseURL, up)
+    r = await t.run("relay", "all")
+    assert.match(r.out, /enabled for 1 provider/)
+    assert.match(t.readCfg().provider.old.options.baseURL, /18791\/old$/)
+    r = await t.run("relay", "none")
+    assert.match(r.out, /disabled for 2 provider/)
+    assert.equal(t.readCfg().provider.old.options.baseURL, up)
+    assert.equal(t.readCfg().provider.auto.options.baseURL, up)
+  } finally {
+    a.srv.close()
+  }
 })

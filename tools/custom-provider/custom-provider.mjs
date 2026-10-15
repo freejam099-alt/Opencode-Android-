@@ -526,12 +526,16 @@ export async function cmdAdd(P, args, flags, io, deps = {}) {
 
   const hadKey = fs.existsSync(P.keyFile(id))
   if (key) writeKey(P, id, key) // key file first: config must never reference a missing file
+  // Relay is ON by default: OpenCode 2.x aborts replies/tool calls from servers that stream content after
+  // finish_reason (very common with proxies). The relay (127.0.0.1) only reorders that field. --no-relay opts out.
+  const useRelay = !flags["no-relay"]
+  reg.relay = reg.relay || { port: DEFAULT_RELAY_PORT }
   const entry = {
     npm: NPM_PKG,
     name,
     options: {
       ...(existingEntry?.options || {}),
-      baseURL,
+      baseURL: useRelay ? relayURL(reg, id) : baseURL,
       ...(key ? { apiKey: `{file:${tildePath(P, P.keyFile(id))}}` } : {}),
       ...(Object.keys(headers).length ? { headers } : {}),
     },
@@ -550,13 +554,14 @@ export async function cmdAdd(P, args, flags, io, deps = {}) {
     throw e
   }
   if (!key && fs.existsSync(P.keyFile(id))) fs.rmSync(P.keyFile(id)) // config no longer references it
-  reg.providers[id] = { name, createdAt: new Date().toISOString() }
+  reg.providers[id] = { name, createdAt: new Date().toISOString(), ...(useRelay ? { upstream: baseURL } : {}) }
   saveRegistry(P, reg)
+  if (useRelay && !deps.noSpawn) info += `${await ensureRelay(P, io)}\n`
 
   io.out(`${info}Added provider "${name}" (id: ${id}) with ${ids.length} model(s).`)
   if (allowed) io.out(`note: your config has enabled_providers/disabled_providers; "${id}" was added to the allow-list so it is not hidden.`)
   if (!ids.length) io.out(`No models yet. Run: models ${id}   (or: set ${id} --models a,b)`)
-  io.out(`Use it in OpenCode as ${id}/<model>. Restart OpenCode to load it. OpenCode Zen is untouched.`)
+  io.out(`Use it in OpenCode as ${id}/<model>. Restart OpenCode to load it. OpenCode Zen is untouched.${useRelay ? "\nStart OpenCode with: opencode-custom-provider launch (the installer also aliases `opencode` to it)." : ""}`)
 }
 
 function modelSummary(sel) {
@@ -647,7 +652,9 @@ export async function cmdSet(P, args, flags, io, deps = {}) {
   const headers = flags.header ? parseHeaders(flags.header) : null
   const regEntry = reg.providers[id]
   const newBase = flags["base-url"] ? normalizeBaseURL(flags["base-url"]) : undefined
-  reg.relay = reg.relay || { port: num(flags.port, "port", DEFAULT_RELAY_PORT) }
+  // the relay port can only change while no provider points at the relay (their URLs embed the port)
+  if (flags.port && !Object.values(reg.providers).some((v) => v.upstream)) reg.relay = { port: num(flags.port, "port") }
+  reg.relay = reg.relay || { port: DEFAULT_RELAY_PORT }
   const manual = flags.models ? String(flags.models).split(",").map((x) => x.trim()).filter(Boolean) : []
   for (const m of manual) if (!MODEL_ID_RE.test(m)) fail(`Invalid model id: ${m}`)
   saveConfig(P, loaded, (cfg) => {
@@ -876,6 +883,36 @@ async function cmdRelay(P, args, flags, io, deps = {}) {
     console.log(`relay listening on 127.0.0.1:${r.port}`)
     return new Promise(() => {}) // keep serving
   }
+  if (sub === "all" || sub === "none") {
+    const on = sub === "all"
+    const loaded = loadConfig(P)
+    const ids = Object.keys(reg.providers).filter((id) => loaded.cfg.provider?.[id])
+    const todo = ids.filter((id) => Boolean(reg.providers[id].upstream) !== on)
+    if (todo.length) {
+      reg.relay = reg.relay || { port }
+      saveConfig(P, loaded, (cfg) => {
+        for (const id of todo) {
+          const e = cfg.provider[id]
+          if (on) {
+            reg.providers[id].upstream = e.options.baseURL
+            e.options.baseURL = relayURL(reg, id)
+          } else {
+            e.options.baseURL = reg.providers[id].upstream
+            delete reg.providers[id].upstream
+          }
+        }
+      }, todo)
+      saveRegistry(P, reg)
+    }
+    let msg = `Relay ${on ? "enabled" : "disabled"} for ${todo.length} provider(s).`
+    if (on && ids.length && !deps.noSpawn) msg += " " + (await ensureRelay(P, io))
+    if (!on) {
+      const st = relayAlive(P)
+      if (st) process.kill(st.pid)
+      fs.rmSync(P.relayState, { force: true })
+    }
+    return io.out(msg)
+  }
   if (sub === "start") return io.out(await ensureRelay(P, io))
   if (sub === "stop") {
     const st = relayAlive(P)
@@ -887,7 +924,7 @@ async function cmdRelay(P, args, flags, io, deps = {}) {
     const up = Object.entries(reg.providers).filter(([, v]) => v.upstream).map(([k]) => k)
     return io.out(`relay: ${relayAlive(P) && (await relayHealthy(port)) ? "running" : "stopped"} (127.0.0.1:${port}); providers using it: ${up.join(", ") || "none"}`)
   }
-  fail(`Unknown relay command "${sub}" (start | stop | status | run)`)
+  fail(`Unknown relay command "${sub}" (start | stop | status | run | all | none)`)
 }
 
 // Start the relay if any provider needs it, then run opencode with the remaining args.
@@ -1146,7 +1183,7 @@ function cmdUninstallCommand(P, io) {
 export function parseArgs(argv) {
   const flags = {}
   const args = []
-  const BOOL = new Set(["no-key", "no-fetch", "key-clipboard", "all", "list", "dry-run", "force", "help", "no-tools", "reasoning", "no-reasoning", "fix", "offline"])
+  const BOOL = new Set(["no-key", "no-fetch", "key-clipboard", "all", "list", "dry-run", "force", "help", "no-tools", "reasoning", "no-reasoning", "fix", "offline", "no-relay"])
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a.startsWith("--")) {
@@ -1176,7 +1213,7 @@ export const HELP = `opencode-custom-provider -- OpenAI-compatible custom provid
   pause | resume                   remove/restore all custom providers (A/B test against built-in providers like Zen)
   diagnose <id> [--model M]        test the stream order of a provider (finds "content after finish reason")
   set <id> --relay on|off          local relay that fixes servers streaming content after finish_reason
-  relay start|stop|status          manage the relay;  launch [opencode args]  starts relay + opencode
+  relay start|stop|status|all|none  manage the relay (all/none = enable/disable for every provider);  launch [opencode args]  starts relay + opencode
   install-command | uninstall-command
                                    add/remove the /custom-provider slash command
 

@@ -77,6 +77,10 @@ truncated tool calls, which may matter for providers with a small output limit).
 
 ## Error: "OpenAI Chat received content after the finish reason"
 
+Handled automatically: `add` turns the relay on by default (`--no-relay` to opt out), `relay all|none` switches every
+provider, and the installer aliases `opencode` to `opencode-custom-provider launch` (starts the relay, then runs
+opencode; `OPENCODE_ANDROID_NO_ALIAS=1` skips the alias). Manual steps for reference:
+
 OpenCode 2.x is strict: if a server sends any content after a chunk that carries `finish_reason`, the reply is
 cut off with this error (seen with some Kimi/Moonshot proxies). Check your provider:
 

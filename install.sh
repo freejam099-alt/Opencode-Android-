@@ -29,7 +29,10 @@ for arg in "$@"; do
 done
 
 if [[ "$UNINSTALL" == "1" ]]; then
-	[[ -f "$BIN" ]] && bash "$BIN" uninstall-command || true
+	[[ -f "$BIN" ]] && { bash "$BIN" relay none || true; bash "$BIN" uninstall-command || true; }
+	for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+		[[ -f "$rc" ]] && sed -i '/# >>> opencode-custom-provider >>>/,/# <<< opencode-custom-provider <<</d' "$rc"
+	done
 	rm -rf "$LIB" "$BIN"
 	log "removed opencode-custom-provider (your providers/config are kept)"
 	exit 0
@@ -169,5 +172,17 @@ install -m 755 "$tmp/custom-provider.mjs" "$LIB/custom-provider.mjs"
 install -m 755 "$tmp/opencode-custom-provider" "$BIN"
 
 bash "$BIN" install-command
+bash "$BIN" relay all || true # fixes "received content after the finish reason" for existing providers too
+
+# `opencode` -> starts the local relay first (idempotent), then runs the real opencode
+RC_BEGIN="# >>> opencode-custom-provider >>>"
+RC_END="# <<< opencode-custom-provider <<<"
+if [[ "${OPENCODE_ANDROID_NO_ALIAS:-0}" != "1" ]]; then
+	for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+		[[ "$rc" == "$HOME/.zshrc" && ! -f "$rc" ]] && continue
+		touch "$rc"
+		grep -qF "$RC_BEGIN" "$rc" || printf '\n%s\nalias opencode='"'"'opencode-custom-provider launch'"'"'\n%s\n' "$RC_BEGIN" "$RC_END" >>"$rc"
+	done
+fi
 log "done. Restart OpenCode, then: /custom-provider add \"My Proxy\" https://api.example.com/v1 --key-clipboard"
 log "or in the shell: opencode-custom-provider"
