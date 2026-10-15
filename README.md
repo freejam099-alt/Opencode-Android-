@@ -19,7 +19,8 @@ pkg install -y curl
 curl -fsSL https://raw.githubusercontent.com/freejam099-alt/Opencode-Android-/main/install.sh | bash
 ```
 
-Skrip ini (sama seperti cara lama: satu `curl | bash`) memasang OpenCode inti bila belum ada (lewat installer repo Hope2333: `curl -fsSL https://hope2333.github.io/repo/install.sh | sh -s -- --install opencode`), `nodejs` bila belum ada, lalu `opencode-custom-provider` + command `/custom-provider`. Restart OpenCode setelahnya.
+Skrip ini (satu `curl | bash`) memasang `nodejs` bila belum ada, lalu OpenCode v2 bila belum ada (file `.deb` aarch64 diunduh langsung dari rilis GitHub Hope2333 dan diverifikasi SHA256, jadi **tidak bergantung pada repo apt/pacman**; error `Unable to locate package opencode` tidak akan muncul), lalu `opencode-custom-provider` + command `/custom-provider`. Restart OpenCode setelahnya.
+Sudah punya OpenCode? Langkah itu dilewati. Pilih versi: `OPENCODE_CORE_VERSION=2.0.27`; pakai file sendiri: `OPENCODE_CORE_DEB=/path/opencode_x_aarch64.deb`. Hanya CPU aarch64.
 
 ### Pakai / Usage
 

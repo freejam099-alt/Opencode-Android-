@@ -10,7 +10,9 @@ OpenCode on Termux, with API key, display name, base URL and automatic model fet
 curl -fsSL https://raw.githubusercontent.com/freejam099-alt/Opencode-Android-/main/install.sh | bash
 ```
 
-Installs OpenCode if missing, `nodejs` if no JS runtime is present, then the add-on and the slash command.
+Installs `nodejs` if no JS runtime is present, then OpenCode if missing (the v2 `.deb` is downloaded from the
+Hope2333 GitHub release and checked against `SHA256SUMS.txt`; the apt/pacman repo is not required), then the add-on and the
+slash command. Env: `OPENCODE_CORE_VERSION=x.y.z`, `OPENCODE_CORE_DEB=/path/file.deb`, `OPENCODE_ANDROID_SKIP_CORE=1`.
 Uninstall: `curl -fsSL .../install.sh | bash -s -- --uninstall`.
 
 Tool calling: new models are written with `tool_call: true` (pass `--no-tools` to omit); OpenCode's
