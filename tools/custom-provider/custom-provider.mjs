@@ -723,55 +723,58 @@ export function cmdRemove(P, args, flags, io) {
 export function createSSENormalizer() {
   let buf = ""
   let pending = null
+  let late = 0
   let meta = {}
-  const finishChunk = () => {
+  const finishEvent = () => {
     const chunk = { id: meta.id ?? "relay", object: "chat.completion.chunk", created: meta.created ?? Math.floor(Date.now() / 1000), model: meta.model ?? "", choices: [{ index: 0, delta: {}, finish_reason: pending.finish_reason }] }
     if (pending.native_finish_reason !== undefined) chunk.choices[0].native_finish_reason = pending.native_finish_reason
     pending = null
     return `data: ${JSON.stringify(chunk)}\n\n`
   }
-  const event = (raw) => {
-    const lines = raw.split("\n")
-    const di = lines.findIndex((l) => l.startsWith("data:"))
-    if (di < 0) return raw + "\n\n"
-    const data = lines[di].slice(5).trim()
-    if (data === "[DONE]") return (pending ? finishChunk() : "") + raw + "\n\n"
+  const hasContent = (d) => Boolean(d && (d.content || d.refusal || d.reasoning_content || d.reasoning || (Array.isArray(d.reasoning_details) && d.reasoning_details.length) || (d.tool_calls || []).some((t) => t.id || t.function?.name || t.function?.arguments)))
+  // Works per `data:` line, so it does not matter how the server separates events (blank line, single newline, CRLF).
+  const line = (l) => {
+    if (!l.startsWith("data:")) return l + "\n"
+    const data = l.slice(5).trim()
+    if (data === "[DONE]") return (pending ? finishEvent() : "") + l + "\n"
     let obj
     try {
       obj = JSON.parse(data)
     } catch {
-      return raw + "\n\n"
+      return l + "\n"
     }
-    if (obj && typeof obj === "object") {
-      for (const k of ["id", "created", "model"]) if (obj[k] !== undefined) meta[k] = obj[k]
-      const c = obj.choices?.[0]
-      if (c && c.finish_reason) {
-        pending = { finish_reason: c.finish_reason, native_finish_reason: c.native_finish_reason }
-        c.finish_reason = null
-        delete c.native_finish_reason
-        lines[di] = "data: " + JSON.stringify(obj)
-        return lines.join("\n") + "\n\n"
-      }
+    if (!obj || typeof obj !== "object") return l + "\n"
+    for (const k of ["id", "created", "model"]) if (obj[k] !== undefined) meta[k] = obj[k]
+    const c = obj.choices?.[0]
+    if (!c) return l + "\n"
+    if (pending && hasContent(c.delta)) late++
+    if (c.finish_reason) {
+      pending = { finish_reason: c.finish_reason, native_finish_reason: c.native_finish_reason }
+      c.finish_reason = null
+      delete c.native_finish_reason
+      return "data: " + JSON.stringify(obj) + "\n"
     }
-    return raw + "\n\n"
+    return l + "\n"
   }
   return {
     push(text) {
       buf += text.replace(/\r\n/g, "\n")
       let out = ""
       let i
-      while ((i = buf.indexOf("\n\n")) >= 0) {
-        const raw = buf.slice(0, i)
-        buf = buf.slice(i + 2)
-        if (raw.trim()) out += event(raw)
+      while ((i = buf.indexOf("\n")) >= 0) {
+        out += line(buf.slice(0, i))
+        buf = buf.slice(i + 1)
       }
       return out
     },
     end() {
-      let out = buf.trim() ? event(buf.trim()) : ""
+      let out = buf ? line(buf) : ""
       buf = ""
-      if (pending) out += finishChunk()
+      if (pending) out += (out.endsWith("\n\n") ? "" : "\n") + finishEvent()
       return out
+    },
+    get late() {
+      return late
     },
   }
 }
@@ -779,11 +782,13 @@ export function createSSENormalizer() {
 const HOP = new Set(["connection", "keep-alive", "transfer-encoding", "content-length", "content-encoding", "host", "accept-encoding", "upgrade", "te", "trailer"])
 
 export function startRelay({ port = DEFAULT_RELAY_PORT, host = "127.0.0.1", getUpstream, fetchImpl = globalThis.fetch }) {
+  const stats = { since: new Date().toISOString(), requests: 0, streams: 0, fixedStreams: 0, lastError: "" }
   const server = http.createServer(async (req, res) => {
     const ctl = new AbortController()
     res.on("close", () => ctl.abort())
     try {
       if (req.url === "/health") return void res.writeHead(200, { "content-type": "text/plain" }).end("ok")
+      if (req.url === "/stats") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(stats))
       const m = /^\/([a-z0-9-]+)(\/.*)?$/.exec(req.url || "")
       const upstream = m && getUpstream(m[1])
       if (!upstream) return void res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "unknown relay provider" } }))
@@ -794,17 +799,21 @@ export function startRelay({ port = DEFAULT_RELAY_PORT, host = "127.0.0.1", getU
         if (size > 25 * 1024 * 1024) return void res.writeHead(413).end()
         chunks.push(c)
       }
+      stats.requests++
+      const bodyBuf = Buffer.concat(chunks)
+      const wantsStream = /"stream"\s*:\s*true/.test(bodyBuf.toString("utf8", 0, Math.min(bodyBuf.length, 2_000_000)))
       const headers = {}
       for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k) && typeof v === "string") headers[k] = v
       headers["accept-encoding"] = "identity"
       const hasBody = !["GET", "HEAD"].includes(req.method)
-      const up = await fetchImpl(upstream + (m[2] || ""), { method: req.method, headers, body: hasBody ? Buffer.concat(chunks) : undefined, signal: ctl.signal })
+      const up = await fetchImpl(upstream + (m[2] || ""), { method: req.method, headers, body: hasBody ? bodyBuf : undefined, signal: ctl.signal })
       const out = {}
       up.headers.forEach((v, k) => {
         if (!HOP.has(k)) out[k] = v
       })
       res.writeHead(up.status, out)
-      const stream = (up.headers.get("content-type") || "").includes("text/event-stream")
+      // normalise when the server says it is an event stream OR the request asked for one (some proxies send a wrong content-type)
+      const stream = (up.headers.get("content-type") || "").includes("text/event-stream") || (wantsStream && up.ok)
       const norm = stream ? createSSENormalizer() : null
       const dec = new TextDecoder()
       if (up.body) {
@@ -818,14 +827,18 @@ export function startRelay({ port = DEFAULT_RELAY_PORT, host = "127.0.0.1", getU
       if (norm) {
         const t = norm.end()
         if (t) res.write(t)
+        stats.streams++
+        if (norm.late > 0) stats.fixedStreams++
       }
       res.end()
     } catch (e) {
       if (ctl.signal.aborted) return
+      stats.lastError = String(e?.cause?.code || e?.message || e).slice(0, 200)
       if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" })
       res.end(JSON.stringify({ error: { message: `relay: upstream error: ${e?.cause?.code || e?.message || e}` } }))
     }
   })
+  server.stats = stats
   return new Promise((resolve, reject) => {
     server.once("error", reject)
     server.listen(port, host, () => resolve({ server, port: server.address().port }))
@@ -922,7 +935,15 @@ async function cmdRelay(P, args, flags, io, deps = {}) {
   }
   if (sub === "status") {
     const up = Object.entries(reg.providers).filter(([, v]) => v.upstream).map(([k]) => k)
-    return io.out(`relay: ${relayAlive(P) && (await relayHealthy(port)) ? "running" : "stopped"} (127.0.0.1:${port}); providers using it: ${up.join(", ") || "none"}`)
+    const alive = relayAlive(P) && (await relayHealthy(port))
+    let st = ""
+    if (alive) {
+      try {
+        const j = await (await fetch(`http://127.0.0.1:${port}/stats`, { signal: AbortSignal.timeout(1500) })).json()
+        st = `\nrequests=${j.requests} streams=${j.streams} repaired-streams=${j.fixedStreams}${j.lastError ? ` last-error=${j.lastError}` : ""}  (requests=0 after a chat means OpenCode is NOT using the relay: run "fix" and restart OpenCode)`
+      } catch {}
+    }
+    return io.out(`relay: ${alive ? "running" : "stopped"} (127.0.0.1:${port}); providers using it: ${up.join(", ") || "none"}${st}`)
   }
   fail(`Unknown relay command "${sub}" (start | stop | status | run | all | none)`)
 }
@@ -951,9 +972,8 @@ export function analyzeStream(text) {
   let late = 0
   let events = 0
   let content = 0
-  for (const block of text.replace(/\r\n/g, "\n").split("\n\n")) {
-    const line = block.split("\n").find((l) => l.startsWith("data:"))
-    if (!line) continue
+  for (const line of text.replace(/\r\n/g, "\n").split("\n")) {
+    if (!line.startsWith("data:")) continue
     const data = line.slice(5).trim()
     if (data === "[DONE]") continue
     let obj
@@ -1094,6 +1114,10 @@ async function cmdDoctor(P, args, flags, io, deps = {}) {
         bad(`${id}: ${e.message}`)
       }
     }
+    if (!reg.providers[id].upstream) {
+      bad(`${id}: relay is OFF. Servers that stream content after finish_reason break replies/tool calls ("received content after the finish reason").`)
+      fixList.push({ relayAll: true })
+    }
     if (reg.providers[id].upstream) {
       const port = reg.relay?.port || DEFAULT_RELAY_PORT
       if (await relayHealthy(port)) ok(`${id}: relay running on 127.0.0.1:${port}`)
@@ -1105,7 +1129,11 @@ async function cmdDoctor(P, args, flags, io, deps = {}) {
   }
   if (flags.fix && fixList.length) {
     for (const f of fixList) {
-      if (f.relay) {
+      if (f.relayAll) {
+        if (!lines.some((l) => l.startsWith("fixed   relay enabled"))) {
+          await cmdRelay(P, ["all"], {}, { out: (m) => lines.push("fixed   " + m) }, deps)
+        }
+      } else if (f.relay) {
         if (!deps.noSpawn) lines.push("fixed   " + (await ensureRelay(P, io)))
       } else {
         saveConfig(P, { file: f.sc.file, cfg: f.sc.cfg, raw: f.sc.raw, existed: true }, (cfg) => allowProvider(cfg, f.id), [f.id])
@@ -1209,6 +1237,7 @@ export const HELP = `opencode-custom-provider -- OpenAI-compatible custom provid
   models [id ...|--all] [options]  re-fetch the model list (--list to print, --dry-run to preview)
   set <id> [options]               change --name / --base-url / key / --header / --models a,b (add models by hand)
   remove <id>                      delete provider, key file and model cache
+  fix                              one command: enable relay for every provider, start it, repair allow-lists
   doctor [id] [--fix] [--offline]   find why a provider/model is not shown (hidden by enabled_providers, missing key file, relay down...)
   pause | resume                   remove/restore all custom providers (A/B test against built-in providers like Zen)
   diagnose <id> [--model M]        test the stream order of a provider (finds "content after finish reason")
@@ -1277,6 +1306,7 @@ export async function main(argv, deps = {}) {
       case "relay": return await cmdRelay(P, args, flags, io, deps)
       case "diagnose": return await cmdDiagnose(P, args, flags, io, deps)
       case "doctor": return await cmdDoctor(P, args, flags, io, deps)
+      case "fix": return await cmdDoctor(P, args, { ...flags, fix: true, offline: true }, io, deps)
       case "pause": return cmdPause(P, io)
       case "resume": return cmdResume(P, io)
       case "install-command": return cmdInstallCommand(P, io)

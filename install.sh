@@ -172,7 +172,7 @@ install -m 755 "$tmp/custom-provider.mjs" "$LIB/custom-provider.mjs"
 install -m 755 "$tmp/opencode-custom-provider" "$BIN"
 
 bash "$BIN" install-command
-bash "$BIN" relay all || true # fixes "received content after the finish reason" for existing providers too
+bash "$BIN" fix || true # enables the relay for every provider (fixes "received content after the finish reason"), repairs allow-lists
 
 # `opencode` -> starts the local relay first (idempotent), then runs the real opencode
 RC_BEGIN="# >>> opencode-custom-provider >>>"

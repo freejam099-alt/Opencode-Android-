@@ -541,3 +541,56 @@ test("relay is ON by default for new providers; relay all/none converts existing
     a.srv.close()
   }
 })
+
+test("relay: wrong content-type, single-newline separators, CRLF and stats counters", async () => {
+  const chunkLine = (d, f = null) => "data: " + JSON.stringify(chunk(d, f)) + "\n"
+  const bodies = {
+    single: chunkLine({ content: "A" }) + chunkLine({ content: "B" }, "stop") + chunkLine({ content: "C" }) + "data: [DONE]\n",
+    crlf: (sse(chunk({ content: "A" }), chunk({ content: "B" }, "stop"), chunk({ content: "C" }), "[DONE]")).replace(/\n/g, "\r\n"),
+  }
+  let mode = "single"
+  const { srv, port: upPort } = await mockServer((req, res) => {
+    req.resume()
+    req.on("end", () => res.writeHead(200, { "content-type": "text/plain" }).end(bodies[mode])) // not text/event-stream!
+  })
+  const relay = await startRelay({ port: 0, getUpstream: () => `http://127.0.0.1:${upPort}/v1` })
+  try {
+    for (mode of ["single", "crlf"]) {
+      const r = await fetch(`http://127.0.0.1:${relay.port}/p/chat/completions`, { method: "POST", body: JSON.stringify({ model: "m", stream: true }) })
+      const text = await r.text()
+      const a = analyzeStream(text)
+      assert.equal(a.late, 0, `${mode}: ${text}`)
+      assert.equal(a.content, 3)
+    }
+    const st = await (await fetch(`http://127.0.0.1:${relay.port}/stats`)).json()
+    assert.equal(st.requests, 2)
+    assert.equal(st.fixedStreams, 2)
+    // non-stream JSON request is not touched even though the server lies about content-type
+    mode = "single"
+  } finally {
+    relay.server.close()
+    srv.close()
+  }
+})
+
+test("fix: converts providers without relay and reports; doctor flags relay OFF", async () => {
+  const a = await listServer(["m1"])
+  const t = sandbox()
+  const up = `http://127.0.0.1:${a.port}/v1`
+  try {
+    await t.run("add", "Old", up, "--no-key")
+    const run = async (...argv) => {
+      process.exitCode = 0
+      const lines = []
+      await main(argv, { env: t.env, io: { interactive: false, out: (s) => lines.push(s), warn: () => {}, ask: async () => "" }, cwd: t.dir, noSpawn: true })
+      return lines.join("\n")
+    }
+    assert.match(await run("doctor", "--offline"), /PROBLEM old: relay is OFF/)
+    const out = await run("fix")
+    assert.match(out, /fixed {3}Relay enabled for 1 provider/)
+    assert.match(t.readCfg().provider.old.options.baseURL, /18791\/old$/)
+    assert.ok(!/relay is OFF/.test(await run("doctor", "--offline")))
+  } finally {
+    a.srv.close()
+  }
+})
